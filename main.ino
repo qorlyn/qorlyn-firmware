@@ -1,15 +1,15 @@
 /* ============================================================================
- * G-Mesh Project v2 - (C) 2026 Emanuele Ferraro & GeoReport International Tech
- * ML-KEM (Kyber-512) + AES-256-GCM (con AAD) + Mesh relay + Trasporto affidabile
+ * (C) Qorlyn 2026. Last update: 12:50:48 04/10/2026 (dd/mm/yyyy) (Italian time)
+ * ML-KEM (Kyber-512) + AES-256-GCM (con AAD) + Mesh relay + Secure transport
  * ----------------------------------------------------------------------------
- * Architettura:
- *   - Un solo RadioTask possiede la radio; tutti gli altri inviano su coda.
- *   - Sessioni crypto per-peer (map peerID -> shared_secret + seq anti-replay).
- *   - Header versionato + flag; AAD autentica l'header (tranne TTL).
- *   - Relay flooding controllato con dedup LRU (32 voci) a livello frame.
- *   - Trasporto stop-and-wait per messaggio: ACK con bitmap, retry fino a 3.
- *   - FEC dinamico reale: interferenza -> CR LoRa 5..8.
- *   - Wake/sleep con persistenza dello stato in RTC_SLOW_MEM.
+ * Connect with us:
+ *   🌐 Website:  https://qorlyn.org
+ *   📧 Email:    qorlyn@qorlyn.org
+ *   💬 Forum:    https://forum.qorlyn.org
+ *    @ Discord:  qorlyn.org/discord
+ *    @ Telegram: qorlyn.org/telegram
+ *    @ GitHub:   qorlyn.org/github
+ *    Donate:     qorlyn.org/donate
  * ==========================================================================*/
 
 #include <Arduino.h>
