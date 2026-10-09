@@ -1,6 +1,6 @@
 /* ============================================================================
  * (C) Qorlyn 2026. Last update: 12:50:48 04/10/2026 (dd/mm/yyyy) (Italian time)
- * ML-KEM (Kyber-512) + AES-256-GCM (con AAD) + Full Onion Routing + E2E ACK
+ * ML-KEM (Kyber-512) + AES-256-GCM (AAD) + Full Onion Routing + Multi-Protocol
  * ----------------------------------------------------------------------------
  * Connect with us:
  *   🌐 Website:  https://qorlyn.org
@@ -21,10 +21,15 @@
 #include <RadioLib.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <ESPAsyncWebServer.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include "pqc_kyber.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -59,14 +64,14 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 // ============================================================================
 // 2. PROTOCOLLO
 // ============================================================================
-#define G_VERSION            0x02
+#define G_VERSION            0x03
 #define STX_BYTE             0x02
 #define ETX_BYTE             0x03
 
 #define DEFAULT_TTL          3
 #define MAX_FRAMES           8
 #define FRAME_PAYLOAD        128
-#define MAX_MESSAGE_BYTES    (MAX_FRAMES * FRAME_PAYLOAD)   // 1024
+#define MAX_MESSAGE_BYTES    (MAX_FRAMES * FRAME_PAYLOAD)
 #define BROADCAST_ID         0xFFFFFFFFu
 
 #define CACHE_SIZE           32
@@ -81,21 +86,28 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 #define KYBER_SK_SIZE        1632
 #define KYBER_CT_SIZE        768
 
-// Onion (layer: next_hop 4 + type 1 + flags 1 + len 2 = 8B; + IV/tag 28B)
-#define ONION_MAX_HOPS          6       // 5 intermedi + target
+// Onion
+#define ONION_MAX_HOPS          6
 #define ONION_LAYER_HDR         8
-#define ONION_LAYER_OVERHEAD    (ONION_LAYER_HDR + 28)   // 36
+#define ONION_LAYER_OVERHEAD    (ONION_LAYER_HDR + 28)
 #define ONION_AAD_LEN           9
 #define ONION_TOKEN_LEN         4
 #define ONION_MAX_PAYLOAD       (MAX_MESSAGE_BYTES - ONION_LAYER_OVERHEAD * ONION_MAX_HOPS - ONION_TOKEN_LEN)
-
 #define ONION_TRACKER_SIZE      4
 #define ONION_TRACKER_TTL       60000UL
 
-#define WIFI_SSID_PREFIX     "G-TALK-"
+// WiFi
+#define WIFI_SSID_PREFIX     "QORLYN-"
 #define WIFI_PASSWORD        "gmesh2026"
 #define WEB_USER             "admin"
 #define WEB_PASS             "gmesh2026"
+#define UDP_DATA_PORT        4200
+
+// BLE
+#define BLE_DEVICE_NAME      "Qorlyn"
+#define BLE_SVC_UUID         "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_RX_CHAR_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_TX_CHAR_UUID     "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 // ============================================================================
 // 3. TIPI
@@ -125,6 +137,13 @@ enum OnionFlags : uint8_t {
     ONION_FLAG_ACK_REQ  = 0x01
 };
 
+enum ProtoType : uint8_t {
+    PROTO_LORA = 0,
+    PROTO_WIFI = 1,
+    PROTO_BT   = 2,
+    PROTO_AUTO = 0xFF
+};
+
 // ============================================================================
 // 4. STRUTTURE
 // ============================================================================
@@ -142,6 +161,7 @@ struct __attribute__((packed)) GPacket {
     uint16_t payloadLen;
     uint32_t timestamp;
     uint32_t seq;
+    uint8_t  originProto;      // <-- NEW
     uint8_t  payload[FRAME_PAYLOAD];
     uint8_t  etx;
 };
@@ -154,6 +174,7 @@ struct PeerSession {
     uint32_t last_rx_seq;
     uint32_t tx_seq;
     unsigned long last_activity;
+    uint8_t  lastSeenProto;    // <-- NEW
 };
 
 struct IncomingMessage {
@@ -206,6 +227,7 @@ TaskHandle_t      radioTaskHandle = nullptr;
 
 Adafruit_SSD1306  oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 AsyncWebServer    server(80);
+WiFiUDP           g_udp;
 
 PeerSession      peers[MAX_PEERS];
 IncomingMessage  rxSlots[RX_SLOT_COUNT];
@@ -222,7 +244,19 @@ volatile uint8_t  interference_level    = 1;
 unsigned long lastActivity = 0;
 unsigned long g_plaintextWarnUntil = 0;
 
-// Buffer statici (protteti da stateMutex). +64 di margine.
+// Stato protocolli
+bool g_loraReady  = false;
+bool g_wifiReady  = false;
+bool g_btReady    = false;
+volatile bool g_bleConnected = false;
+uint8_t g_lastRxProto = PROTO_LORA;
+
+// BLE handles
+BLEServer*         g_bleServer  = nullptr;
+BLECharacteristic* g_bleTxChar  = nullptr;
+BLECharacteristic* g_bleRxChar  = nullptr;
+
+// Buffer onion (protetti da stateMutex)
 #define ONION_BUF (MAX_MESSAGE_BYTES + 64)
 static uint8_t s_onionA[ONION_BUF];
 static uint8_t s_onionB[ONION_BUF];
@@ -238,6 +272,15 @@ static uint8_t DynamicFEC(uint8_t lvl) {
     if (lvl <= 5)  return 6;
     if (lvl <= 8)  return 7;
     return 8;
+}
+
+static const char* protoName(uint8_t p) {
+    switch (p) {
+        case PROTO_LORA: return "LoRa";
+        case PROTO_WIFI: return "WiFi";
+        case PROTO_BT:   return "BT";
+        default:         return "?";
+    }
 }
 
 static void updateUI(const char* status, const char* info, float rssi = 0, float snr = 0) {
@@ -322,6 +365,7 @@ static PeerSession* peerGetOrCreate(uint32_t id) {
             memset(&peers[i], 0, sizeof(PeerSession));
             peers[i].inUse = true;
             peers[i].peerID = id;
+            peers[i].lastSeenProto = PROTO_LORA;
             peers[i].last_activity = nowMs();
             return &peers[i];
         }
@@ -332,6 +376,7 @@ static PeerSession* peerGetOrCreate(uint32_t id) {
     memset(&peers[oldest], 0, sizeof(PeerSession));
     peers[oldest].inUse = true;
     peers[oldest].peerID = id;
+    peers[oldest].lastSeenProto = PROTO_LORA;
     peers[oldest].last_activity = nowMs();
     return &peers[oldest];
 }
@@ -472,7 +517,7 @@ static void kyberEnsureKeypair() {
 }
 
 // ============================================================================
-// 11. RADIO TASK
+// 11. TRASPORTO LoRa
 // ============================================================================
 static void radioTransmitBlocking(const GPacket& p) {
     uint32_t start = nowMs();
@@ -480,12 +525,12 @@ static void radioTransmitBlocking(const GPacket& p) {
     radio.standby();
     delay(20);
     int st = radio.transmit((uint8_t*)&p, sizeof(GPacket));
-    if (st != RADIOLIB_ERR_NONE) Serial.printf("[TX] err=%d\n", st);
+    if (st != RADIOLIB_ERR_NONE) Serial.printf("[TX-LoRa] err=%d\n", st);
     delay(20);
     radio.startReceive();
 }
 
-static void handleReceivedPacket(GPacket& p, float rssi, float snr);
+static void handleReceivedPacketFromProto(GPacket& p, ProtoType src);
 
 static void radioTask(void*) {
     TxRequest req;
@@ -497,7 +542,7 @@ static void radioTask(void*) {
         int st = radio.receive((uint8_t*)&p, sizeof(GPacket), 100);
         if (st == RADIOLIB_ERR_NONE) {
             if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION) {
-                handleReceivedPacket(p, radio.getRSSI(), radio.getSNR());
+                handleReceivedPacketFromProto(p, PROTO_LORA);
             } else crc_error_count++;
         } else if (st == RADIOLIB_ERR_CRC_MISMATCH) crc_error_count++;
         recalcInterference();
@@ -511,7 +556,144 @@ static bool enqueueTx(const GPacket& p) {
 }
 
 // ============================================================================
-// 12. HEADER
+// 12. TRASPORTO WiFi (UDP broadcast)
+// ============================================================================
+static IPAddress wifiBroadcast() {
+    IPAddress ip;
+    IPAddress mask;
+    if (WiFi.getMode() & WIFI_MODE_AP) {
+        ip   = WiFi.softAPIP();
+        mask = IPAddress(255, 255, 255, 0);
+    } else {
+        ip   = WiFi.localIP();
+        mask = WiFi.subnetMask();
+    }
+    return IPAddress(ip[0] | ~mask[0], ip[1] | ~mask[1],
+                     ip[2] | ~mask[2], ip[3] | ~mask[3]);
+}
+
+static void wifiSend(const GPacket& p) {
+    if (!g_wifiReady) return;
+    IPAddress bcast = wifiBroadcast();
+    g_udp.beginPacket(bcast, UDP_DATA_PORT);
+    g_udp.write((const uint8_t*)&p, sizeof(GPacket));
+    g_udp.endPacket();
+}
+
+static void wifiDataTick() {
+    if (!g_wifiReady) return;
+    int sz = g_udp.parsePacket();
+    if (sz < (int)sizeof(GPacket)) return;
+    GPacket p;
+    int n = g_udp.read((char*)&p, sizeof(GPacket));
+    if (n == (int)sizeof(GPacket) &&
+        p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION) {
+        if (p.senderID != myID) {
+            handleReceivedPacketFromProto(p, PROTO_WIFI);
+        }
+    }
+}
+
+// ============================================================================
+// 13. TRASPORTO BLE (GATT server)
+// ============================================================================
+class QorlynBleServerCB : public BLEServerCallbacks {
+    void onConnect(BLEServer*) override {
+        g_bleConnected = true;
+        Serial.println("[BLE] central connected");
+    }
+    void onDisconnect(BLEServer*) override {
+        g_bleConnected = false;
+        Serial.println("[BLE] central disconnected");
+        BLEDevice::startAdvertising();
+    }
+};
+
+class QorlynBleRxCB : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* c) override {
+        std::string v = c->getValue();
+        if (v.length() != sizeof(GPacket)) return;
+        GPacket p;
+        memcpy(&p, v.data(), sizeof(GPacket));
+        if (p.stx != STX_BYTE || p.etx != ETX_BYTE || p.version != G_VERSION) return;
+        if (p.senderID == myID) return;
+        handleReceivedPacketFromProto(p, PROTO_BT);
+    }
+};
+
+static void bleSend(const GPacket& p) {
+    if (!g_btReady || !g_bleConnected || !g_bleTxChar) return;
+    g_bleTxChar->setValue((uint8_t*)&p, sizeof(GPacket));
+    g_bleTxChar->notify();
+}
+
+static void bleSetup() {
+    BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(517);
+    g_bleServer = BLEDevice::createServer();
+    g_bleServer->setCallbacks(new QorlynBleServerCB());
+
+    BLEService* svc = g_bleServer->createService(BLE_SVC_UUID);
+
+    g_bleRxChar = svc->createCharacteristic(BLE_RX_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    g_bleRxChar->setCallbacks(new QorlynBleRxCB());
+
+    g_bleTxChar = svc->createCharacteristic(BLE_TX_CHAR_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY);
+    g_bleTxChar->addDescriptor(new BLE2902());
+
+    svc->start();
+
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(BLE_SVC_UUID);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    adv->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+
+    g_btReady = true;
+    Serial.println("[BLE] ready, advertising");
+}
+
+// ============================================================================
+// 14. SELEZIONE TRASPORTO
+// ============================================================================
+static ProtoType selectProtoFor(uint32_t target) {
+    // Se conosciamo il peer, rispetta il suo ultimo proto (se disponibile)
+    if (target != BROADCAST_ID) {
+        PeerSession* ps = peerFind(target);
+        if (ps && ps->inUse) {
+            ProtoType pref = (ProtoType)ps->lastSeenProto;
+            if (pref == PROTO_LORA && g_loraReady) return PROTO_LORA;
+            if (pref == PROTO_WIFI && g_wifiReady) return PROTO_WIFI;
+            if (pref == PROTO_BT   && g_btReady && g_bleConnected) return PROTO_BT;
+        }
+    }
+    // Priorità fissa: LoRa > WiFi > BT
+    if (g_loraReady) return PROTO_LORA;
+    if (g_wifiReady) return PROTO_WIFI;
+    if (g_btReady && g_bleConnected) return PROTO_BT;
+    return PROTO_LORA;  // fallback
+}
+
+static void sendVia(ProtoType proto, const GPacket& p) {
+    switch (proto) {
+        case PROTO_LORA: enqueueTx(p); break;
+        case PROTO_WIFI: wifiSend(p); break;
+        case PROTO_BT:   bleSend(p); break;
+        default:         enqueueTx(p); break;
+    }
+}
+
+static void transmitFrame(GPacket& p) {
+    ProtoType useProto = selectProtoFor(p.targetID);
+    p.originProto = (uint8_t)useProto;
+    sendVia(useProto, p);
+}
+
+// ============================================================================
+// 15. HEADER
 // ============================================================================
 static GPacket buildHeader(GMessageType type, uint32_t target,
                            uint8_t totalFrames, uint8_t frameIdx,
@@ -525,12 +707,12 @@ static GPacket buildHeader(GMessageType type, uint32_t target,
     p.msgType = (uint8_t)type; p.ttl = ttl;
     p.frameIdx = frameIdx; p.totalFrames = totalFrames;
     p.payloadLen = payloadLen; p.timestamp = nowMs() / 1000;
-    p.seq = seq; p.etx = ETX_BYTE;
+    p.seq = seq; p.originProto = PROTO_LORA; p.etx = ETX_BYTE;
     return p;
 }
 
 // ============================================================================
-// 13. OUTGOING
+// 16. OUTGOING
 // ============================================================================
 static OutgoingMessage* outgoingAlloc() {
     for (int i = 0; i < MAX_OUTGOING; i++)
@@ -547,7 +729,8 @@ static bool sendFrameOfOutgoing(OutgoingMessage* o, uint8_t idx) {
                             o->totalFrames, idx, o->frameLens[idx],
                             o->flags, o->sessionID, g_sessionCounter++, DEFAULT_TTL);
     memcpy(p.payload, o->frameData[idx], o->frameLens[idx]);
-    return enqueueTx(p);
+    transmitFrame(p);
+    return true;
 }
 
 static void outgoingStart(GMessageType type, uint32_t target,
@@ -626,7 +809,7 @@ static void outgoingTick() {
 }
 
 // ============================================================================
-// 14. REASSEMBLY
+// 17. REASSEMBLY
 // ============================================================================
 static IncomingMessage* rxSlotFor(const GPacket& p, bool create) {
     for (int i = 0; i < RX_SLOT_COUNT; i++)
@@ -666,7 +849,7 @@ static void sendAckBitmap(uint32_t target, uint16_t session, uint8_t mask) {
     GPacket p = buildHeader(MSG_ACK, target, 1, 0, 4, 0,
                             ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
     memcpy(p.payload, payload, 4);
-    enqueueTx(p);
+    transmitFrame(p);
 }
 
 static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len);
@@ -700,7 +883,7 @@ static void handlePacketReassembly(GPacket& p) {
 }
 
 // ============================================================================
-// 15. ONION TRACKER (per ACK end-to-end)
+// 18. ONION TRACKER
 // ============================================================================
 static void onionTrackerSweep() {
     unsigned long t = nowMs();
@@ -714,7 +897,6 @@ static void onionTrackerSweep() {
 }
 
 static uint32_t onionTrackerAdd(uint32_t targetID) {
-    // Trova slot libero (o il più vecchio)
     int slot = -1;
     for (int i = 0; i < ONION_TRACKER_SIZE; i++)
         if (!g_onionTrackers[i].active) { slot = i; break; }
@@ -745,16 +927,8 @@ static bool onionTrackerConsume(uint32_t token) {
 }
 
 // ============================================================================
-// 16. ONION ROUTING
-// ----------------------------------------------------------------------------
-// Layer (dopo decifratura): [next_hop:4][type:1][flags:1][len:2][payload]
-//   next_hop == 0  -> siamo destinatario finale
-//   next_hop != 0  -> forward
-// AAD layer = [version:1][orig_sender:4][this_hop:4]
-// flags & ONION_FLAG_ACK_REQ (solo innermost) -> il payload inizia con 4B token
-// Multi-frame nativo via outgoingStart.
+// 19. ONION ROUTING
 // ============================================================================
-
 static void buildOnionAAD(uint32_t origSender, uint32_t thisHop,
                           uint8_t* aad, size_t& aadLen) {
     size_t i = 0;
@@ -764,7 +938,6 @@ static void buildOnionAAD(uint32_t origSender, uint32_t thisHop,
     aadLen = i;
 }
 
-// Forward decl
 static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
                                    uint8_t* data, uint16_t len,
                                    bool ackReq, uint32_t ackToken);
@@ -802,16 +975,13 @@ static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
         xSemaphoreGiveRecursive(stateMutex); return;
     }
 
-    // Copia ciphertext interno
     memmove(s_onionB, nextData, nextLen);
 
     if (nextHop == 0) {
-        // Siamo il destinatario finale
         if (nextType == MSG_ONION || nextType == MSG_ACK || nextType == MSG_ONION_ACK) {
             Serial.printf("[ONION] inner type forbidden 0x%02X\n", nextType);
             xSemaphoreGiveRecursive(stateMutex); return;
         }
-
         bool ackReq = (nextFlags & ONION_FLAG_ACK_REQ) != 0;
         uint32_t ackToken = 0;
         uint8_t* userData = s_onionB;
@@ -819,7 +989,6 @@ static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
 
         if (ackReq) {
             if (nextLen < ONION_TOKEN_LEN) {
-                Serial.println("[ONION] ack token mancante");
                 xSemaphoreGiveRecursive(stateMutex); return;
             }
             ackToken = ((uint32_t)s_onionB[0] << 24) | ((uint32_t)s_onionB[1] << 16)
@@ -827,19 +996,25 @@ static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
             userData = s_onionB + ONION_TOKEN_LEN;
             userLen  = nextLen - ONION_TOKEN_LEN;
         }
-
         dispatchOnionDelivered(origSender, nextType, userData, userLen, ackReq, ackToken);
-        Serial.printf("[ONION] final delivered from %08X len=%u ackReq=%d\n",
+        Serial.printf("[ONION] final delivered from %08X len=%u ack=%d\n",
                       origSender, userLen, ackReq ? 1 : 0);
     } else {
-        // Relay
         if (nextType != MSG_ONION) {
-            Serial.printf("[ONION] inner non-onion 0x%02X\n", nextType);
             xSemaphoreGiveRecursive(stateMutex); return;
         }
-        outgoingStart(MSG_ONION, nextHop, s_onionB, nextLen,
-                      FLAG_RELAY_OK | FLAG_NO_RETRY, false);
-        Serial.printf("[ONION] relay -> %08X (%u B)\n", nextHop, nextLen);
+        // Relay via stesso proto d'ingresso per coerenza
+        GPacket fwd = buildHeader(MSG_ONION, nextHop, 1, 0, nextLen,
+                                  FLAG_RELAY_OK | FLAG_NO_RETRY,
+                                  ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+        fwd.senderID = origSender;
+        fwd.flags &= ~FLAG_ACK_REQ;
+        memcpy(fwd.payload, s_onionB, nextLen);
+        ProtoType src = (ProtoType)g_lastRxProto;
+        fwd.originProto = (uint8_t)src;
+        sendVia(src, fwd);
+        Serial.printf("[ONION] relay -> %08X via %s (%u B)\n",
+                      nextHop, protoName(src), nextLen);
     }
 
     xSemaphoreGiveRecursive(stateMutex);
@@ -853,7 +1028,6 @@ static bool onionSend(GMessageType finalType, uint32_t target,
 
     uint8_t pathLen = nHops + 1;
     if (pathLen > ONION_MAX_HOPS) {
-        Serial.printf("[ONION] too many hops (%u > %u)\n", pathLen, ONION_MAX_HOPS);
         xSemaphoreGiveRecursive(stateMutex); return false;
     }
 
@@ -863,7 +1037,6 @@ static bool onionSend(GMessageType finalType, uint32_t target,
 
     for (uint8_t i = 0; i < pathLen; i++) {
         if (path[i] == BROADCAST_ID) {
-            Serial.println("[ONION] no broadcast");
             xSemaphoreGiveRecursive(stateMutex); return false;
         }
         PeerSession* ps = peerFind(path[i]);
@@ -875,24 +1048,18 @@ static bool onionSend(GMessageType finalType, uint32_t target,
 
     uint16_t overhead = ONION_LAYER_OVERHEAD * pathLen + (ackReq ? ONION_TOKEN_LEN : 0);
     if (dataLen + overhead > MAX_MESSAGE_BYTES) {
-        Serial.printf("[ONION] payload %u too big (path=%u ack=%d)\n",
-                      dataLen, pathLen, ackReq ? 1 : 0);
         xSemaphoreGiveRecursive(stateMutex); return false;
     }
 
-    uint32_t ackToken = 0;
-    if (ackReq) {
-        ackToken = onionTrackerAdd(target);
-    }
+    uint32_t ackToken = ackReq ? onionTrackerAdd(target) : 0;
 
     uint16_t bufLen = 0;
     uint8_t* cur = s_onionA;
     uint8_t* nxt = s_onionB;
 
-    // --- Layer 0 (innermost, per il target) ---
     {
         uint16_t i = 0;
-        nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0;  // next_hop = 0
+        nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0;
         nxt[i++] = (uint8_t)finalType;
         nxt[i++] = ackReq ? ONION_FLAG_ACK_REQ : 0;
         uint16_t innerLen = (ackReq ? ONION_TOKEN_LEN : 0) + dataLen;
@@ -911,13 +1078,11 @@ static bool onionSend(GMessageType finalType, uint32_t target,
         buildOnionAAD(myID, target, aad, aadLen);
         uint16_t outLen;
         if (!gcmEncryptAAD(tps->shared_secret, aad, aadLen, nxt, i, cur, outLen)) {
-            Serial.println("[ONION] enc layer0 fail");
             xSemaphoreGiveRecursive(stateMutex); return false;
         }
         bufLen = outLen;
     }
 
-    // --- Layer intermedi (dal più interno al più esterno) ---
     for (int i = (int)nHops - 1; i >= 0; i--) {
         PeerSession* ps = peerFind(path[i]);
         uint32_t nextHop = path[i + 1];
@@ -928,7 +1093,7 @@ static bool onionSend(GMessageType finalType, uint32_t target,
         nxt[j++] = (nextHop >>  8) & 0xFF;
         nxt[j++] = (nextHop      ) & 0xFF;
         nxt[j++] = (uint8_t)MSG_ONION;
-        nxt[j++] = 0;  // flags
+        nxt[j++] = 0;
         nxt[j++] = (bufLen >> 8) & 0xFF;
         nxt[j++] = bufLen & 0xFF;
         memcpy(nxt + j, cur, bufLen); j += bufLen;
@@ -937,16 +1102,16 @@ static bool onionSend(GMessageType finalType, uint32_t target,
         buildOnionAAD(myID, path[i], aad, aadLen);
         uint16_t outLen;
         if (!gcmEncryptAAD(ps->shared_secret, aad, aadLen, nxt, j, cur, outLen)) {
-            Serial.printf("[ONION] enc layer %d fail\n", i);
             xSemaphoreGiveRecursive(stateMutex); return false;
         }
         bufLen = outLen;
     }
 
     uint32_t firstHop = (nHops > 0) ? path[0] : target;
-    Serial.printf("[ONION] send path=%u target=%08X len=%u ack=%d token=%08X\n",
-                  pathLen, target, bufLen, ackReq ? 1 : 0, ackToken);
+    Serial.printf("[ONION] send path=%u target=%08X len=%u ack=%d\n",
+                  pathLen, target, bufLen, ackReq ? 1 : 0);
 
+    // Il primo hop viene scelto in base a selectProtoFor
     outgoingStart(MSG_ONION, firstHop, cur, bufLen,
                   FLAG_RELAY_OK | FLAG_NO_RETRY, false);
 
@@ -955,12 +1120,11 @@ static bool onionSend(GMessageType finalType, uint32_t target,
 }
 
 // ============================================================================
-// 17. ONION DELIVERY + ACK E2E
+// 20. ONION DELIVERY + ACK
 // ============================================================================
 static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
                                    uint8_t* data, uint16_t len,
                                    bool ackReq, uint32_t ackToken) {
-    // Se ACK richiesto: manda MSG_ONION_ACK cifrato direttamente a origSender
     if (ackReq) {
         uint8_t ackPayload[ONION_TOKEN_LEN];
         ackPayload[0] = (ackToken >> 24) & 0xFF;
@@ -968,9 +1132,8 @@ static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
         ackPayload[2] = (ackToken >>  8) & 0xFF;
         ackPayload[3] = (ackToken      ) & 0xFF;
 
-        // Cifra con sessione S<->T (già esistente)
         PeerSession* ps = peerFind(origSender);
-        if (ps && ps->established && len + ENC_OVERHEAD <= FRAME_PAYLOAD) {
+        if (ps && ps->established && ONION_TOKEN_LEN + ENC_OVERHEAD <= FRAME_PAYLOAD) {
             uint8_t flags = FLAG_RELAY_OK | FLAG_ENCRYPTED;
             uint16_t sessionID = ++g_sessionCounter;
             uint32_t seq = ps->tx_seq++;
@@ -983,14 +1146,12 @@ static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
                                blob, blobLen)) {
                 memcpy(p.payload, blob, blobLen);
                 p.payloadLen = blobLen;
-                enqueueTx(p);
-                Serial.printf("[ONION] ACK inviato a %08X token=%08X\n",
-                              origSender, ackToken);
+                transmitFrame(p);
+                Serial.printf("[ONION] ACK inviato a %08X\n", origSender);
             }
         }
     }
 
-    // Dispatch del messaggio utente
     switch (type) {
         case MSG_HEARTBEAT:
             Serial.printf("[ONION] HB da %08X\n", origSender);
@@ -1008,19 +1169,18 @@ static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
             break;
         }
         default:
-            Serial.printf("[ONION] tipo 0x%02X len=%u da %08X\n",
-                          type, len, origSender);
+            Serial.printf("[ONION] tipo 0x%02X len=%u da %08X\n", type, len, origSender);
             break;
     }
 }
 
 // ============================================================================
-// 18. FINAL MESSAGE DISPATCH
+// 21. FINAL DISPATCH
 // ============================================================================
 static void handleKeyExchange(uint8_t type, const uint8_t* data, uint16_t len,
                               uint32_t remoteID) {
     if (type == MSG_KYBER_PUBKEY) {
-        if (len != KYBER_PK_SIZE) { Serial.println("[KYBER] PK size"); return; }
+        if (len != KYBER_PK_SIZE) return;
         static uint8_t ct[KYBER_CT_SIZE];
         uint8_t shared[32];
         pqc_kyber512_encapsulate(ct, shared, data);
@@ -1029,18 +1189,18 @@ static void handleKeyExchange(uint8_t type, const uint8_t* data, uint16_t len,
         ps->established = true; ps->tx_seq = 1; ps->last_rx_seq = 0;
         ps->last_activity = nowMs();
         outgoingStart(MSG_KYBER_CIPHERTEXT, remoteID, ct, KYBER_CT_SIZE, FLAG_RELAY_OK);
-        Serial.printf("[KYBER] session %08X ready (responder)\n", remoteID);
+        Serial.printf("[KYBER] session %08X ready\n", remoteID);
         updateUI("SECURE", "Handshake OK");
     } else if (type == MSG_KYBER_CIPHERTEXT) {
-        if (len != KYBER_CT_SIZE) { Serial.println("[KYBER] CT size"); return; }
-        if (!g_kyber_ready) { Serial.println("[KYBER] no keypair"); return; }
+        if (len != KYBER_CT_SIZE) return;
+        if (!g_kyber_ready) return;
         uint8_t shared[32];
         pqc_kyber512_decapsulate(shared, data, g_kyber_sk);
         PeerSession* ps = peerGetOrCreate(remoteID);
         memcpy(ps->shared_secret, shared, 32);
         ps->established = true; ps->tx_seq = 1; ps->last_rx_seq = 0;
         ps->last_activity = nowMs();
-        Serial.printf("[KYBER] session %08X ready (initiator)\n", remoteID);
+        Serial.printf("[KYBER] session %08X ready\n", remoteID);
         updateUI("SECURE", "Handshake OK");
     }
 }
@@ -1066,7 +1226,6 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
     }
     if (type == MSG_NACK) { Serial.printf("[RX] NACK %08X\n", sender); return; }
 
-    // Plaintext warn
     if (!(frame.flags & FLAG_ENCRYPTED) && (frame.flags & FLAG_PLAINTEXT_WARN)
         && frame.targetID != BROADCAST_ID) {
         Serial.printf("[RX] *** PLAINTEXT da %08X ***\n", sender);
@@ -1079,10 +1238,7 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
 
     if (frame.flags & FLAG_ENCRYPTED) {
         PeerSession* ps = peerFind(sender);
-        if (!ps || !ps->established) {
-            Serial.printf("[RX] enc from unknown %08X\n", sender);
-            return;
-        }
+        if (!ps || !ps->established) return;
         uint16_t outLen = 0;
         if (!decryptGCM_AAD(ps->shared_secret, frame, data, len, tmp, outLen)) {
             Serial.println("[RX] GCM auth fail");
@@ -1100,7 +1256,7 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
 
     switch (type) {
         case MSG_HEARTBEAT:
-            Serial.println("[RX] HB");
+            Serial.printf("[RX] HB via %s\n", protoName(g_lastRxProto));
             break;
         case MSG_SOS_MEDIC:
             Serial.println("[RX] !!! SOS MEDICO !!!");
@@ -1110,37 +1266,43 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
             char buf[MAX_MESSAGE_BYTES + 1];
             uint16_t n = plainLen > MAX_MESSAGE_BYTES ? MAX_MESSAGE_BYTES : plainLen;
             memcpy(buf, plain, n); buf[n] = '\0';
-            Serial.printf("[RX] Chat %08X: %s\n", sender, buf);
+            Serial.printf("[RX] Chat %08X via %s: %s\n",
+                          sender, protoName(g_lastRxProto), buf);
             updateUI("CHAT", buf);
             break;
         }
         case MSG_ONION_ACK: {
-            if (plainLen < ONION_TOKEN_LEN) {
-                Serial.println("[ONION] ACK malformato");
-                break;
-            }
+            if (plainLen < ONION_TOKEN_LEN) break;
             uint32_t tok = ((uint32_t)plain[0] << 24) | ((uint32_t)plain[1] << 16)
                          | ((uint32_t)plain[2] <<  8) |  (uint32_t)plain[3];
             if (onionTrackerConsume(tok)) {
-                Serial.printf("[ONION] *** ACK E2E ricevuto da %08X token=%08X ***\n",
-                              sender, tok);
+                Serial.printf("[ONION] *** ACK E2E da %08X ***\n", sender);
                 updateUI("ONION ACK", "delivered");
-            } else {
-                Serial.printf("[ONION] ACK sconosciuto token=%08X\n", tok);
             }
             break;
         }
         default:
-            Serial.printf("[RX] type 0x%02X len=%u\n", type, plainLen);
+            Serial.printf("[RX] type 0x%02X len=%u via %s\n",
+                          type, plainLen, protoName(g_lastRxProto));
             break;
     }
 }
 
 // ============================================================================
-// 19. RICEZIONE
+// 22. RICEZIONE (entry point multi-proto)
 // ============================================================================
-static void handleReceivedPacket(GPacket& p, float rssi, float snr) {
+static void handleReceivedPacketFromProto(GPacket& p, ProtoType src) {
     if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
+
+    g_lastRxProto = (uint8_t)src;
+
+    // Aggiorna lastSeenProto SOLO se il pacchetto è diretto (originProto == src)
+    // perché se è relayato, originProto riflette il proto dell'originatore, non del last-hop.
+    if (p.senderID != myID && (ProtoType)p.originProto == src) {
+        PeerSession* ps = peerFind(p.senderID);
+        if (ps && ps->inUse) ps->lastSeenProto = (uint8_t)src;
+    }
+
     if (dedupCheckAndInsert(p.senderID, p.sessionID, p.frameIdx)) {
         xSemaphoreGiveRecursive(stateMutex); return;
     }
@@ -1151,12 +1313,16 @@ static void handleReceivedPacket(GPacket& p, float rssi, float snr) {
 
     if (!forMe) foreign_packets_count++;
 
-    // Relay generico (non onion). MSG_ONION è relayato solo dal layer logico.
+    // Relay (non onion). MSG_ONION è gestito dal layer logico.
     if (relayable && p.targetID != myID && p.msgType != MSG_ONION) {
-        GPacket r = p; r.ttl--; enqueueTx(r);
+        GPacket r = p;
+        r.ttl--;
+        // Relay via stesso proto d'ingresso
+        r.originProto = (uint8_t)src;
+        sendVia(src, r);
     }
     if (forMe) {
-        updateUI("RX", "Msg in arrivo", rssi, snr);
+        updateUI("RX", protoName(src), 0, 0);
         handlePacketReassembly(p);
     }
     lastActivity = nowMs();
@@ -1164,7 +1330,7 @@ static void handleReceivedPacket(GPacket& p, float rssi, float snr) {
 }
 
 // ============================================================================
-// 20. SEND SECURE OR PLAIN
+// 23. SEND SECURE OR PLAIN
 // ============================================================================
 static void sendSecureOrPlain(GMessageType type, uint32_t target,
                               const uint8_t* data, uint16_t len) {
@@ -1183,12 +1349,9 @@ static void sendSecureOrPlain(GMessageType type, uint32_t target,
         if (encryptGCM_AAD(ps->shared_secret, p, data, len, blob, blobLen)) {
             memcpy(p.payload, blob, blobLen);
             p.payloadLen = blobLen;
-            enqueueTx(p);
+            transmitFrame(p);
             return;
         }
-        Serial.println("[TX] encrypt fail -> plaintext");
-    } else if (doEnc) {
-        Serial.println("[TX] payload too big -> plaintext");
     }
 
     uint8_t flags = FLAG_RELAY_OK;
@@ -1203,7 +1366,7 @@ static void sendSecureOrPlain(GMessageType type, uint32_t target,
 }
 
 // ============================================================================
-// 21. HEARTBEAT
+// 24. HEARTBEAT (broadcast su tutti i protocolli)
 // ============================================================================
 static unsigned long lastHeartbeat = 0;
 static void heartbeatTick() {
@@ -1212,12 +1375,22 @@ static void heartbeatTick() {
         xSemaphoreGiveRecursive(stateMutex); return;
     }
     lastHeartbeat = nowMs();
+
+    // Heartbeat su LoRa (mesh backbone)
     outgoingStart(MSG_HEARTBEAT, BROADCAST_ID, nullptr, 0, FLAG_RELAY_OK);
+
+    // Inoltre heartbeat diretto via WiFi e BT se disponibili
+    GPacket hb = buildHeader(MSG_HEARTBEAT, BROADCAST_ID, 1, 0, 0,
+                             FLAG_RELAY_OK | FLAG_BROADCAST,
+                             ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+    if (g_wifiReady) { hb.originProto = PROTO_WIFI; wifiSend(hb); }
+    if (g_btReady && g_bleConnected) { hb.originProto = PROTO_BT; bleSend(hb); }
+
     xSemaphoreGiveRecursive(stateMutex);
 }
 
 // ============================================================================
-// 22. WEB UI
+// 25. WEB UI
 // ============================================================================
 static bool webAuth(AsyncWebServerRequest* r) {
     if (!r->authenticate(WEB_USER, WEB_PASS)) {
@@ -1254,7 +1427,6 @@ static void setupWeb() {
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
         if (!webAuth(req)) return;
         lastActivity = nowMs();
-
         String h;
         h += "<!DOCTYPE HTML><html><head><meta charset='utf-8'>";
         h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
@@ -1265,15 +1437,20 @@ static void setupWeb() {
         h += ".key{background:#fbc02d;color:#000}.onion{background:#5e35b1;color:#fff}";
         h += "input[type=text]{padding:10px;width:85%;margin:6px;border-radius:6px;border:none}";
         h += ".hint{font-size:12px;color:#888;margin-top:4px}";
-        h += "label{display:inline-block;margin:8px}";
+        h += ".proto{font-size:12px;color:#aaa;margin-top:6px}";
         h += "</style></head><body>";
         char idbuf[16]; sprintf(idbuf, "%08X", myID);
         h += "<h2>Qorlyn</h2><div>ID: "; h += idbuf; h += "</div>";
+        h += "<div class='proto'>LoRa: ";
+        h += g_loraReady ? "ON" : "off";
+        h += " | WiFi: "; h += g_wifiReady ? "ON" : "off";
+        h += " | BT: ";   h += (g_btReady && g_bleConnected) ? "ON" : (g_btReady ? "adv" : "off");
+        h += "</div>";
         h += "<input type='text' id='t' placeholder='Target ID (hex)' value='FFFFFFFF'>";
         h += "<input type='text' id='hops' placeholder='Onion hops (hex, comma sep.)' value=''>";
         h += "<div class='hint'>es. <code>DEADBEEF,12345678</code> = 2 hop intermedi (max 5)</div>";
         h += "<input type='text' id='m' placeholder='Messaggio'>";
-        h += "<label><input type='checkbox' id='ack' checked> Richiedi ACK end-to-end</label>";
+        h += "<label><input type='checkbox' id='ack' checked> ACK end-to-end</label>";
         h += "<br><button class='msg' onclick=\"s('CHAT')\">CHAT</button>";
         h += "<button class='sos' onclick=\"s('SOS')\">SOS MEDICO</button>";
         h += "<button class='key' onclick=\"s('KEY')\">HANDSHAKE KYBER</button>";
@@ -1307,10 +1484,8 @@ static void setupWeb() {
     server.on("/send", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (!webAuth(req)) return;
         lastActivity = nowMs();
-
         if (!req->hasParam("type", true) || !req->hasParam("target", true)) {
-            req->send(400, "text/plain", "parametri mancanti");
-            return;
+            req->send(400, "text/plain", "parametri mancanti"); return;
         }
         String type    = req->getParam("type", true)->value();
         String tstr    = req->getParam("target", true)->value();
@@ -1322,13 +1497,11 @@ static void setupWeb() {
         char* endp = nullptr;
         uint32_t target = strtoul(tstr.c_str(), &endp, 16);
         if (!endp || *endp != '\0' || tstr.length() == 0) {
-            req->send(400, "text/plain", "target non valido");
-            return;
+            req->send(400, "text/plain", "target non valido"); return;
         }
 
         if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) {
-            req->send(500, "text/plain", "mutex error");
-            return;
+            req->send(500, "text/plain", "mutex error"); return;
         }
 
         if (type == "ONION") {
@@ -1336,8 +1509,7 @@ static void setupWeb() {
             uint8_t nHops = parseHops(hopsStr, hops, ONION_MAX_HOPS - 1);
             if (msg.length() > MAX_MESSAGE_BYTES) {
                 xSemaphoreGiveRecursive(stateMutex);
-                req->send(413, "text/plain", "msg troppo lungo");
-                return;
+                req->send(413, "text/plain", "msg troppo lungo"); return;
             }
             bool ok = onionSend(MSG_CHAT, target,
                                 (const uint8_t*)msg.c_str(), msg.length(),
@@ -1348,7 +1520,6 @@ static void setupWeb() {
             return;
         }
 
-        // Check plaintext fallback
         if ((type == "SOS" || type == "CHAT") && target != BROADCAST_ID) {
             PeerSession* ps = peerFind(target);
             bool willEncrypt = (ps && ps->established);
@@ -1357,8 +1528,7 @@ static void setupWeb() {
             }
             if (!willEncrypt && !force) {
                 xSemaphoreGiveRecursive(stateMutex);
-                req->send(409, "text/plain", "PLAINTEXT_FALLBACK");
-                return;
+                req->send(409, "text/plain", "PLAINTEXT_FALLBACK"); return;
             }
         }
 
@@ -1367,33 +1537,34 @@ static void setupWeb() {
         } else if (type == "CHAT") {
             if (msg.length() > MAX_MESSAGE_BYTES) {
                 xSemaphoreGiveRecursive(stateMutex);
-                req->send(413, "text/plain", "msg troppo lungo");
-                return;
+                req->send(413, "text/plain", "msg troppo lungo"); return;
             }
             sendSecureOrPlain(MSG_CHAT, target, (const uint8_t*)msg.c_str(), msg.length());
         } else if (type == "KEY") {
             if (target == BROADCAST_ID) {
                 xSemaphoreGiveRecursive(stateMutex);
-                req->send(400, "text/plain", "no broadcast handshake");
-                return;
+                req->send(400, "text/plain", "no broadcast handshake"); return;
             }
             kyberEnsureKeypair();
             outgoingStart(MSG_KYBER_PUBKEY, target, g_kyber_pk, KYBER_PK_SIZE, FLAG_RELAY_OK);
         } else {
             xSemaphoreGiveRecursive(stateMutex);
-            req->send(400, "text/plain", "tipo sconosciuto");
-            return;
+            req->send(400, "text/plain", "tipo sconosciuto"); return;
         }
-
         xSemaphoreGiveRecursive(stateMutex);
         req->send(200, "text/plain", "ok");
     });
 
     server.begin();
+
+    // UDP data transport
+    g_udp.begin(UDP_DATA_PORT);
+    g_wifiReady = true;
+    Serial.printf("[WiFi] UDP data port %d ready\n", UDP_DATA_PORT);
 }
 
 // ============================================================================
-// 23. SERIAL
+// 26. SERIAL
 // ============================================================================
 static void serialTick() {
     if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
@@ -1418,8 +1589,9 @@ static void serialTick() {
             case 'p':
                 for (int i = 0; i < MAX_PEERS; i++)
                     if (peers[i].inUse)
-                        Serial.printf("peer %08X est=%d last_rx=%u\n",
+                        Serial.printf("peer %08X est=%d via=%s last_rx=%u\n",
                                       peers[i].peerID, peers[i].established,
+                                      protoName(peers[i].lastSeenProto),
                                       peers[i].last_rx_seq);
                 break;
             case 'o':
@@ -1430,13 +1602,17 @@ static void serialTick() {
                                       g_onionTrackers[i].targetID,
                                       (unsigned long)(nowMs() - g_onionTrackers[i].sentAt));
                 break;
+            case 'w':
+                Serial.printf("LoRa:%d WiFi:%d BT:%d (bleConn:%d)\n",
+                              g_loraReady, g_wifiReady, g_btReady, g_bleConnected);
+                break;
         }
     }
     xSemaphoreGiveRecursive(stateMutex);
 }
 
 // ============================================================================
-// 24. SLEEP
+// 27. SLEEP
 // ============================================================================
 static void enterSleep() {
     Serial.println("[SLEEP] deep sleep");
@@ -1446,6 +1622,7 @@ static void enterSleep() {
     server.end();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+    BLEDevice::deinit(true);
 
     esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);
     esp_sleep_enable_ext1_wakeup((1ULL << RADIO_DIO1_PIN), ESP_EXT1_WAKEUP_ANY_HIGH);
@@ -1464,7 +1641,7 @@ static void printWakeReason() {
 }
 
 // ============================================================================
-// 25. RADIO SETUP
+// 28. RADIO SETUP
 // ============================================================================
 static bool setupRadio() {
     Serial.println("[RADIO] init");
@@ -1485,12 +1662,13 @@ static bool setupRadio() {
     radio.setOutputPower(10);
     delay(50);
     radio.startReceive();
+    g_loraReady = true;
     Serial.println("[RADIO] ready");
     return true;
 }
 
 // ============================================================================
-// 26. OLED SETUP
+// 29. OLED SETUP
 // ============================================================================
 static void setupOLED() {
     pinMode(OLED_PWR, OUTPUT);
@@ -1515,7 +1693,7 @@ static void setupOLED() {
 }
 
 // ============================================================================
-// 27. SETUP / LOOP
+// 30. SETUP / LOOP
 // ============================================================================
 void setup() {
     Serial.begin(115200);
@@ -1526,8 +1704,6 @@ void setup() {
                   (unsigned)sizeof(IncomingMessage),
                   (unsigned)sizeof(OutgoingMessage),
                   (unsigned)sizeof(OnionTracker));
-    Serial.printf("ONION: max hops=%u, max payload=%u B\n",
-                  (unsigned)ONION_MAX_HOPS, (unsigned)ONION_MAX_PAYLOAD);
 
     myID = g_myID ? g_myID : generateDeviceID();
     g_myID = myID;
@@ -1551,10 +1727,12 @@ void setup() {
     if (!g_kyber_ready) kyberEnsureKeypair();
     else Serial.println("[KYBER] keypair da RTC");
 
-    setupWeb();
+    setupWeb();      // include g_wifiReady = true
+    bleSetup();      // include g_btReady = true
 
     lastActivity = nowMs();
     updateUI("READY", "online");
+    Serial.printf("[BOOT] LoRa:%d WiFi:%d BT:%d\n", g_loraReady, g_wifiReady, g_btReady);
 }
 
 void loop() {
@@ -1566,9 +1744,14 @@ void loop() {
     onionTrackerSweep();
     heartbeatTick();
     serialTick();
+    wifiDataTick();
 
     if (nowMs() < g_plaintextWarnUntil) updateUI("PLAINTEXT!", "msg in chiaro");
-    else updateUI("READY", "online");
+    else {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "via %s", protoName(g_lastRxProto));
+        updateUI("READY", buf);
+    }
 
     delay(20);
 }
