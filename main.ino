@@ -1,6 +1,7 @@
 /* ============================================================================
- * (C) Qorlyn 2026. Last update: 12:50:48 04/10/2026 (dd/mm/yyyy) (Italian time)
- * ML-KEM (Kyber-512) + AES-256-GCM (AAD) + Full Onion Routing + Multi-Protocol
+ * (C) Qorlyn 2026. Last update: 04/10/2026 (dd/mm/yyyy) (Italian time)
+ * ML-KEM (Kyber-512) + AES-256-GCM + Onion routing (X25519 effimero per-hop)
+ * + Multi-protocol transport (LoRa / WiFi STA+AP / BLE peripheral+central)
  * ----------------------------------------------------------------------------
  * Connect with us:
  *   🌐 Website:  https://qorlyn.org
@@ -18,6 +19,8 @@
 #include <esp_sleep.h>
 #include <esp_attr.h>
 #include "mbedtls/gcm.h"
+#include "mbedtls/ecdh.h"
+#include "mbedtls/ecp.h"
 #include <RadioLib.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -28,6 +31,7 @@
 #include <Adafruit_SSD1306.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
+#include <BLEClient.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "pqc_kyber.h"
@@ -64,7 +68,7 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 // ============================================================================
 // 2. PROTOCOLLO
 // ============================================================================
-#define G_VERSION            0x03
+#define G_VERSION            0x04
 #define STX_BYTE             0x02
 #define ETX_BYTE             0x03
 
@@ -86,15 +90,19 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 #define KYBER_SK_SIZE        1632
 #define KYBER_CT_SIZE        768
 
+// X25519
+#define X25519_KEY_SIZE      32
+
 // Onion
-#define ONION_MAX_HOPS          6
-#define ONION_LAYER_HDR         8
-#define ONION_LAYER_OVERHEAD    (ONION_LAYER_HDR + 28)
-#define ONION_AAD_LEN           9
-#define ONION_TOKEN_LEN         4
-#define ONION_MAX_PAYLOAD       (MAX_MESSAGE_BYTES - ONION_LAYER_OVERHEAD * ONION_MAX_HOPS - ONION_TOKEN_LEN)
-#define ONION_TRACKER_SIZE      4
-#define ONION_TRACKER_TTL       60000UL
+#define ONION_MAX_HOPS       6
+#define ONION_LAYER_HDR      8        // next(4)+type(1)+flags(1)+len(2)
+#define ONION_EPH_PUB        32
+#define ONION_LAYER_OVERHEAD (ONION_EPH_PUB + 12 + 16 + ONION_LAYER_HDR)  // 68
+#define ONION_TOKEN_LEN      4
+#define ONION_INNER_HDR      8        // origin(4)+token(4) nel layer innermost
+#define ONION_MAX_PAYLOAD    (MAX_MESSAGE_BYTES - ONION_LAYER_OVERHEAD * ONION_MAX_HOPS - ONION_INNER_HDR)
+#define ONION_TRACKER_SIZE   4
+#define ONION_TRACKER_TTL    60000UL
 
 // WiFi
 #define WIFI_SSID_PREFIX     "QORLYN-"
@@ -102,26 +110,40 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 #define WEB_USER             "admin"
 #define WEB_PASS             "gmesh2026"
 #define UDP_DATA_PORT        4200
+#define WIFI_STA_TIMEOUT_MS  8000
 
 // BLE
-#define BLE_DEVICE_NAME      "Qorlyn"
+#define BLE_DEVICE_PREFIX    "QORLYN"
 #define BLE_SVC_UUID         "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_RX_CHAR_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_TX_CHAR_UUID     "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_MTU_PAYLOAD      480      // max chunk inviato via notify
+#define BLE_SCAN_INTERVAL_MS 15000
+#define BLE_MAX_CENTRALS     2
+
+// Peer
+#define PENDING_MAX          4
+#define PENDING_TIMEOUT      300000UL
+#define HYBRID_AUTO_LIMIT    3
+#define BLOCKLIST_MAX        8
+#define WHITELIST_MAX        8
+#define REQUEST_MIN_INTERVAL 2000UL
 
 // ============================================================================
 // 3. TIPI
 // ============================================================================
 enum GMessageType : uint8_t {
-    MSG_HEARTBEAT       = 0x01,
-    MSG_SOS_MEDIC       = 0x03,
-    MSG_ACK             = 0x08,
-    MSG_NACK            = 0x1B,
-    MSG_CHAT            = 0x1C,
-    MSG_KYBER_PUBKEY    = 0x20,
-    MSG_KYBER_CIPHERTEXT= 0x21,
-    MSG_ONION           = 0x22,
-    MSG_ONION_ACK       = 0x23
+    MSG_HEARTBEAT        = 0x01,
+    MSG_SOS_MEDIC        = 0x03,
+    MSG_ACK              = 0x08,
+    MSG_NACK             = 0x1B,
+    MSG_CHAT             = 0x1C,
+    MSG_KYBER_PUBKEY     = 0x20,
+    MSG_KYBER_CIPHERTEXT = 0x21,
+    MSG_ONION            = 0x22,
+    MSG_ONION_ACK        = 0x23,
+    MSG_KYBER_REJECT     = 0x24,
+    MSG_X25519_PUBKEY    = 0x25
 };
 
 enum PacketFlags : uint8_t {
@@ -130,7 +152,8 @@ enum PacketFlags : uint8_t {
     FLAG_RELAY_OK       = 0x04,
     FLAG_BROADCAST      = 0x08,
     FLAG_PLAINTEXT_WARN = 0x10,
-    FLAG_NO_RETRY       = 0x20
+    FLAG_NO_RETRY       = 0x20,
+    FLAG_X25519_ENC     = 0x40
 };
 
 enum OnionFlags : uint8_t {
@@ -140,8 +163,21 @@ enum OnionFlags : uint8_t {
 enum ProtoType : uint8_t {
     PROTO_LORA = 0,
     PROTO_WIFI = 1,
-    PROTO_BT   = 2,
-    PROTO_AUTO = 0xFF
+    PROTO_BT   = 2
+};
+
+enum PeerState : uint8_t {
+    PEER_NONE        = 0,
+    PEER_PENDING_IN  = 1,
+    PEER_PENDING_OUT = 2,
+    PEER_ESTABLISHED = 3
+};
+
+enum AcceptPolicy : uint8_t {
+    POLICY_AUTO      = 0,
+    POLICY_MANUAL    = 1,
+    POLICY_WHITELIST = 2,
+    POLICY_HYBRID    = 3
 };
 
 // ============================================================================
@@ -161,20 +197,22 @@ struct __attribute__((packed)) GPacket {
     uint16_t payloadLen;
     uint32_t timestamp;
     uint32_t seq;
-    uint8_t  originProto;      // <-- NEW
+    uint8_t  originProto;
     uint8_t  payload[FRAME_PAYLOAD];
     uint8_t  etx;
 };
 
 struct PeerSession {
-    bool     inUse;
-    uint32_t peerID;
-    bool     established;
-    uint8_t  shared_secret[32];
-    uint32_t last_rx_seq;
-    uint32_t tx_seq;
+    PeerState state;
+    uint32_t  peerID;
+    uint8_t   shared_secret[32];        // Kyber
+    uint8_t   x25519_pk[X25519_KEY_SIZE]; // pubkey X25519 del peer
+    bool      has_x25519_pk;
+    uint32_t  last_rx_seq;
+    uint32_t  tx_seq;
     unsigned long last_activity;
-    uint8_t  lastSeenProto;    // <-- NEW
+    unsigned long last_request_time;
+    uint8_t   lastSeenProto;
 };
 
 struct IncomingMessage {
@@ -211,6 +249,13 @@ struct OnionTracker {
     unsigned long sentAt;
 };
 
+struct PendingPeer {
+    bool     active;
+    uint32_t peerID;
+    uint8_t  pk[KYBER_PK_SIZE];
+    unsigned long since;
+};
+
 // ============================================================================
 // 5. GLOBALI
 // ============================================================================
@@ -219,17 +264,29 @@ RTC_DATA_ATTR uint32_t g_myID           = 0;
 RTC_DATA_ATTR uint8_t  g_kyber_pk[KYBER_PK_SIZE];
 RTC_DATA_ATTR uint8_t  g_kyber_sk[KYBER_SK_SIZE];
 RTC_DATA_ATTR bool     g_kyber_ready    = false;
+RTC_DATA_ATTR uint8_t  g_x25519_sk[X25519_KEY_SIZE];
+RTC_DATA_ATTR uint8_t  g_x25519_pk[X25519_KEY_SIZE];
+RTC_DATA_ATTR bool     g_x25519_ready   = false;
+
+RTC_DATA_ATTR PeerSession peers[MAX_PEERS];
+RTC_DATA_ATTR uint8_t     g_policy           = POLICY_MANUAL;
+RTC_DATA_ATTR uint32_t    g_blocklist[BLOCKLIST_MAX];
+RTC_DATA_ATTR uint8_t     g_blocklist_count  = 0;
+RTC_DATA_ATTR uint32_t    g_whitelist[WHITELIST_MAX];
+RTC_DATA_ATTR uint8_t     g_whitelist_count  = 0;
 
 uint32_t myID = 0;
 SemaphoreHandle_t stateMutex = nullptr;
 QueueHandle_t     txQueue    = nullptr;
 TaskHandle_t      radioTaskHandle = nullptr;
+TaskHandle_t      bleTaskHandle   = nullptr;
+TaskHandle_t      wifiTaskHandle  = nullptr;
 
 Adafruit_SSD1306  oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 AsyncWebServer    server(80);
 WiFiUDP           g_udp;
 
-PeerSession      peers[MAX_PEERS];
+PendingPeer      g_pending[PENDING_MAX];
 IncomingMessage  rxSlots[RX_SLOT_COUNT];
 OutgoingMessage  outgoing[MAX_OUTGOING];
 OnionTracker     g_onionTrackers[ONION_TRACKER_SIZE];
@@ -244,20 +301,29 @@ volatile uint8_t  interference_level    = 1;
 unsigned long lastActivity = 0;
 unsigned long g_plaintextWarnUntil = 0;
 
-// Stato protocolli
-bool g_loraReady  = false;
-bool g_wifiReady  = false;
-bool g_btReady    = false;
-volatile bool g_bleConnected = false;
+bool g_loraReady = false;
+bool g_wifiReady = false;
+bool g_btReady   = false;
+volatile bool g_bleCentralConnected = false;
 uint8_t g_lastRxProto = PROTO_LORA;
 
-// BLE handles
+// BLE peripheral
 BLEServer*         g_bleServer  = nullptr;
 BLECharacteristic* g_bleTxChar  = nullptr;
 BLECharacteristic* g_bleRxChar  = nullptr;
 
-// Buffer onion (protetti da stateMutex)
-#define ONION_BUF (MAX_MESSAGE_BYTES + 64)
+// BLE central (connessioni in uscita)
+struct BleCentralLink {
+    bool           active;
+    BLEClient*     client;
+    BLERemoteCharacteristic* txChar;   // notifichiamo qui
+    BLERemoteCharacteristic* rxChar;   // scriviamo qui
+    uint32_t       peerID;             // ID del peer remoto
+    unsigned long  lastSeen;
+};
+BleCentralLink g_bleCentrals[BLE_MAX_CENTRALS];
+
+#define ONION_BUF (MAX_MESSAGE_BYTES + 128)
 static uint8_t s_onionA[ONION_BUF];
 static uint8_t s_onionB[ONION_BUF];
 static uint8_t s_onionPlain[ONION_BUF];
@@ -268,9 +334,9 @@ static uint8_t s_onionPlain[ONION_BUF];
 static inline uint32_t nowMs() { return millis(); }
 
 static uint8_t DynamicFEC(uint8_t lvl) {
-    if (lvl <= 2)  return 5;
-    if (lvl <= 5)  return 6;
-    if (lvl <= 8)  return 7;
+    if (lvl <= 2) return 5;
+    if (lvl <= 5) return 6;
+    if (lvl <= 8) return 7;
     return 8;
 }
 
@@ -281,6 +347,42 @@ static const char* protoName(uint8_t p) {
         case PROTO_BT:   return "BT";
         default:         return "?";
     }
+}
+
+static const char* peerStateName(PeerState s) {
+    switch (s) {
+        case PEER_NONE:        return "none";
+        case PEER_PENDING_IN:  return "pending-in";
+        case PEER_PENDING_OUT: return "pending-out";
+        case PEER_ESTABLISHED: return "established";
+        default:               return "?";
+    }
+}
+
+static const char* policyName(uint8_t p) {
+    switch (p) {
+        case POLICY_AUTO:      return "auto";
+        case POLICY_MANUAL:    return "manual";
+        case POLICY_WHITELIST: return "whitelist";
+        case POLICY_HYBRID:    return "hybrid";
+        default:               return "?";
+    }
+}
+
+static void recalcInterference() {
+    uint32_t lvl = (foreign_packets_count / 10) + (crc_error_count / 5);
+    if (lvl > 10) lvl = 10;
+    if (lvl < 1)  lvl = 1;
+    interference_level = (uint8_t)lvl;
+}
+
+static uint32_t generateDeviceID() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    uint32_t id = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16)
+                | ((uint32_t)mac[4] << 8)  | (uint32_t)mac[5];
+    if (id == BROADCAST_ID) id ^= 0x1;
+    return id;
 }
 
 static void updateUI(const char* status, const char* info, float rssi = 0, float snr = 0) {
@@ -303,13 +405,15 @@ static void updateUI(const char* status, const char* info, float rssi = 0, float
     oled.setCursor(0, 0);
     oled.printf("ID: %08X", myID);
     oled.setCursor(0, 10);
-    oled.print("Sec: ");
-    bool anySecure = false;
-    for (int i = 0; i < MAX_PEERS; i++)
-        if (peers[i].inUse && peers[i].established) { anySecure = true; break; }
-    oled.print(anySecure ? "KYBER+GCM" : "OFF");
+    oled.print("Pol: ");
+    oled.print(policyName(g_policy));
+    int nEst = 0, nPend = 0;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers[i].state == PEER_ESTABLISHED) nEst++;
+        else if (peers[i].state == PEER_PENDING_IN || peers[i].state == PEER_PENDING_OUT) nPend++;
+    }
     oled.setCursor(0, 22);
-    oled.printf("FEC:%u INT:%u", DynamicFEC(interference_level), interference_level);
+    oled.printf("Est:%d Pend:%d", nEst, nPend);
     if (rssi != 0) {
         oled.setCursor(0, 34);
         oled.printf("Sig %.1f dBm SNR %.1f", rssi, snr);
@@ -319,22 +423,6 @@ static void updateUI(const char* status, const char* info, float rssi = 0, float
     oled.setCursor(0, 56);
     oled.print(info);
     oled.display();
-}
-
-static void recalcInterference() {
-    uint32_t lvl = (foreign_packets_count / 10) + (crc_error_count / 5);
-    if (lvl > 10) lvl = 10;
-    if (lvl < 1)  lvl = 1;
-    interference_level = (uint8_t)lvl;
-}
-
-static uint32_t generateDeviceID() {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    uint32_t id = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16)
-                | ((uint32_t)mac[4] << 8)  | (uint32_t)mac[5];
-    if (id == BROADCAST_ID) id ^= 0x1;
-    return id;
 }
 
 // ============================================================================
@@ -349,49 +437,116 @@ static bool dedupCheckAndInsert(uint32_t sender, uint16_t session, uint8_t frame
 }
 
 // ============================================================================
-// 8. PEER SESSIONS
+// 8. X25519
 // ============================================================================
-static PeerSession* peerFind(uint32_t id) {
-    for (int i = 0; i < MAX_PEERS; i++)
-        if (peers[i].inUse && peers[i].peerID == id) return &peers[i];
-    return nullptr;
-}
-
-static PeerSession* peerGetOrCreate(uint32_t id) {
-    PeerSession* p = peerFind(id);
-    if (p) return p;
-    for (int i = 0; i < MAX_PEERS; i++) {
-        if (!peers[i].inUse) {
-            memset(&peers[i], 0, sizeof(PeerSession));
-            peers[i].inUse = true;
-            peers[i].peerID = id;
-            peers[i].lastSeenProto = PROTO_LORA;
-            peers[i].last_activity = nowMs();
-            return &peers[i];
-        }
+static bool x25519GenKeypair(uint8_t* sk, uint8_t* pk) {
+    mbedtls_ecdh_context ctx;
+    mbedtls_ecdh_init(&ctx);
+    if (mbedtls_ecdh_setup(&ctx, MBEDTLS_ECP_DP_CURVE25519) != 0) {
+        mbedtls_ecdh_free(&ctx);
+        return false;
     }
-    int oldest = 0;
-    for (int i = 1; i < MAX_PEERS; i++)
-        if (peers[i].last_activity < peers[oldest].last_activity) oldest = i;
-    memset(&peers[oldest], 0, sizeof(PeerSession));
-    peers[oldest].inUse = true;
-    peers[oldest].peerID = id;
-    peers[oldest].lastSeenProto = PROTO_LORA;
-    peers[oldest].last_activity = nowMs();
-    return &peers[oldest];
+    unsigned char buf[64];
+    size_t olen;
+    if (mbedtls_ecdh_make_public(&ctx, &olen, buf, sizeof(buf), esp_random, NULL) != 0) {
+        mbedtls_ecdh_free(&ctx);
+        return false;
+    }
+    memcpy(pk, buf, X25519_KEY_SIZE);
+    if (mbedtls_mpi_write_binary(&ctx.d, sk, X25519_KEY_SIZE) != 0) {
+        mbedtls_ecdh_free(&ctx);
+        return false;
+    }
+    mbedtls_ecdh_free(&ctx);
+    return true;
 }
 
-static void peersSweep() {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
-    unsigned long t = nowMs();
-    for (int i = 0; i < MAX_PEERS; i++)
-        if (peers[i].inUse && (t - peers[i].last_activity > 30UL * 60UL * 1000UL))
-            memset(&peers[i], 0, sizeof(PeerSession));
-    xSemaphoreGiveRecursive(stateMutex);
+static bool x25519Shared(const uint8_t* my_sk, const uint8_t* peer_pk, uint8_t* out) {
+    mbedtls_ecdh_context ctx;
+    mbedtls_ecdh_init(&ctx);
+    if (mbedtls_ecdh_setup(&ctx, MBEDTLS_ECP_DP_CURVE25519) != 0) {
+        mbedtls_ecdh_free(&ctx);
+        return false;
+    }
+    if (mbedtls_mpi_read_binary(&ctx.d, my_sk, X25519_KEY_SIZE) != 0) {
+        mbedtls_ecdh_free(&ctx);
+        return false;
+    }
+    if (mbedtls_ecdh_read_public(&ctx, peer_pk, X25519_KEY_SIZE) != 0) {
+        mbedtls_ecdh_free(&ctx);
+        return false;
+    }
+    unsigned char buf[32];
+    size_t olen;
+    if (mbedtls_ecdh_calc_secret(&ctx, &olen, buf, sizeof(buf), esp_random, NULL) != 0) {
+        mbedtls_ecdh_free(&ctx);
+        return false;
+    }
+    memcpy(out, buf, 32);
+    mbedtls_ecdh_free(&ctx);
+    return true;
+}
+
+static void x25519EnsureKeypair() {
+    if (g_x25519_ready) return;
+    Serial.println("[X25519] keypair...");
+    if (!x25519GenKeypair(g_x25519_sk, g_x25519_pk)) {
+        Serial.println("[X25519] FAIL");
+        return;
+    }
+    g_x25519_ready = true;
+    Serial.println("[X25519] ready");
+}
+
+// AES-GCM con chiave X25519
+static bool x25519Encrypt(const uint8_t* shared_key,
+                          const uint8_t* aad, size_t aadLen,
+                          const uint8_t* plaintext, uint16_t len,
+                          uint8_t* out, uint16_t& outLen) {
+    if (len + 28 > ONION_BUF) return false;
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, shared_key, 256) != 0) {
+        mbedtls_gcm_free(&gcm); return false;
+    }
+    uint8_t iv[12];
+    for (int i = 0; i < 12; i++) iv[i] = (uint8_t)esp_random();
+    memcpy(out, iv, 12);
+    uint8_t tag[16];
+    int r = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, len,
+                                      iv, 12, aad, aadLen,
+                                      plaintext, out + 28, 16, tag);
+    memcpy(out + 12, tag, 16);
+    mbedtls_gcm_free(&gcm);
+    if (r != 0) return false;
+    outLen = len + 28;
+    return true;
+}
+
+static bool x25519Decrypt(const uint8_t* shared_key,
+                          const uint8_t* aad, size_t aadLen,
+                          const uint8_t* in, uint16_t inLen,
+                          uint8_t* out, uint16_t& outLen) {
+    if (inLen < 28) return false;
+    uint16_t clen = inLen - 28;
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, shared_key, 256) != 0) {
+        mbedtls_gcm_free(&gcm); return false;
+    }
+    uint8_t iv[12], tag[16];
+    memcpy(iv, in, 12);
+    memcpy(tag, in + 12, 16);
+    int r = mbedtls_gcm_auth_decrypt(&gcm, clen, iv, 12, aad, aadLen,
+                                     tag, 16, in + 28, out);
+    mbedtls_gcm_free(&gcm);
+    if (r != 0) return false;
+    outLen = clen;
+    return true;
 }
 
 // ============================================================================
-// 9. CRITTOGRAFIA
+// 9. CRITTOGRAFIA (Kyber sessions)
 // ============================================================================
 #define ENC_OVERHEAD 28
 
@@ -459,52 +614,6 @@ static bool decryptGCM_AAD(const uint8_t* key, const GPacket& p,
     return true;
 }
 
-static bool gcmEncryptAAD(const uint8_t* key,
-                          const uint8_t* aad, size_t aadLen,
-                          const uint8_t* plaintext, uint16_t len,
-                          uint8_t* out, uint16_t& outLen) {
-    if (len + ENC_OVERHEAD > ONION_BUF) return false;
-    mbedtls_gcm_context gcm;
-    mbedtls_gcm_init(&gcm);
-    if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256) != 0) {
-        mbedtls_gcm_free(&gcm); return false;
-    }
-    uint8_t iv[12];
-    for (int i = 0; i < 12; i++) iv[i] = (uint8_t)esp_random();
-    memcpy(out, iv, 12);
-    uint8_t tag[16];
-    int r = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, len,
-                                      iv, 12, aad, aadLen,
-                                      plaintext, out + ENC_OVERHEAD, 16, tag);
-    memcpy(out + 12, tag, 16);
-    mbedtls_gcm_free(&gcm);
-    if (r != 0) return false;
-    outLen = len + ENC_OVERHEAD;
-    return true;
-}
-
-static bool gcmDecryptAAD(const uint8_t* key,
-                          const uint8_t* aad, size_t aadLen,
-                          const uint8_t* in, uint16_t inLen,
-                          uint8_t* out, uint16_t& outLen) {
-    if (inLen < ENC_OVERHEAD) return false;
-    uint16_t cipherLen = inLen - ENC_OVERHEAD;
-    mbedtls_gcm_context gcm;
-    mbedtls_gcm_init(&gcm);
-    if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256) != 0) {
-        mbedtls_gcm_free(&gcm); return false;
-    }
-    uint8_t iv[12], tag[16];
-    memcpy(iv, in, 12);
-    memcpy(tag, in + 12, 16);
-    int r = mbedtls_gcm_auth_decrypt(&gcm, cipherLen, iv, 12, aad, aadLen,
-                                     tag, 16, in + ENC_OVERHEAD, out);
-    mbedtls_gcm_free(&gcm);
-    if (r != 0) return false;
-    outLen = cipherLen;
-    return true;
-}
-
 // ============================================================================
 // 10. KYBER
 // ============================================================================
@@ -513,221 +622,190 @@ static void kyberEnsureKeypair() {
     Serial.println("[KYBER] keypair...");
     pqc_kyber512_keypair(g_kyber_pk, g_kyber_sk);
     g_kyber_ready = true;
-    Serial.println("[KYBER] ready.");
+    Serial.println("[KYBER] ready");
 }
 
 // ============================================================================
-// 11. TRASPORTO LoRa
+// 11. PEER
 // ============================================================================
-static void radioTransmitBlocking(const GPacket& p) {
-    uint32_t start = nowMs();
-    while (digitalRead(LORA_BUSY) == HIGH && (nowMs() - start) < 500) delay(1);
-    radio.standby();
-    delay(20);
-    int st = radio.transmit((uint8_t*)&p, sizeof(GPacket));
-    if (st != RADIOLIB_ERR_NONE) Serial.printf("[TX-LoRa] err=%d\n", st);
-    delay(20);
-    radio.startReceive();
+static PeerSession* peerFind(uint32_t id) {
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (peers[i].state != PEER_NONE && peers[i].peerID == id) return &peers[i];
+    return nullptr;
 }
 
-static void handleReceivedPacketFromProto(GPacket& p, ProtoType src);
-
-static void radioTask(void*) {
-    TxRequest req;
-    for (;;) {
-        while (xQueueReceive(txQueue, &req, 0) == pdTRUE)
-            radioTransmitBlocking(req.packet);
-
-        GPacket p;
-        int st = radio.receive((uint8_t*)&p, sizeof(GPacket), 100);
-        if (st == RADIOLIB_ERR_NONE) {
-            if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION) {
-                handleReceivedPacketFromProto(p, PROTO_LORA);
-            } else crc_error_count++;
-        } else if (st == RADIOLIB_ERR_CRC_MISMATCH) crc_error_count++;
-        recalcInterference();
-        vTaskDelay(pdMS_TO_TICKS(2));
+static PeerSession* peerAlloc() {
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (peers[i].state == PEER_NONE) return &peers[i];
+    int best = -1;
+    unsigned long bestT = ULONG_MAX;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers[i].state == PEER_ESTABLISHED) continue;
+        if (peers[i].last_activity < bestT) { bestT = peers[i].last_activity; best = i; }
     }
+    if (best >= 0) return &peers[best];
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (peers[i].last_activity < bestT) { bestT = peers[i].last_activity; best = i; }
+    return best >= 0 ? &peers[best] : nullptr;
 }
 
-static bool enqueueTx(const GPacket& p) {
-    TxRequest r; r.packet = p;
-    return xQueueSend(txQueue, &r, pdMS_TO_TICKS(500)) == pdTRUE;
+static PeerSession* peerGetOrCreate(uint32_t id) {
+    PeerSession* p = peerFind(id);
+    if (p) return p;
+    PeerSession* slot = peerAlloc();
+    if (!slot) return nullptr;
+    memset(slot, 0, sizeof(PeerSession));
+    slot->peerID = id;
+    slot->last_activity = nowMs();
+    slot->lastSeenProto = PROTO_LORA;
+    return slot;
 }
 
-// ============================================================================
-// 12. TRASPORTO WiFi (UDP broadcast)
-// ============================================================================
-static IPAddress wifiBroadcast() {
-    IPAddress ip;
-    IPAddress mask;
-    if (WiFi.getMode() & WIFI_MODE_AP) {
-        ip   = WiFi.softAPIP();
-        mask = IPAddress(255, 255, 255, 0);
-    } else {
-        ip   = WiFi.localIP();
-        mask = WiFi.subnetMask();
-    }
-    return IPAddress(ip[0] | ~mask[0], ip[1] | ~mask[1],
-                     ip[2] | ~mask[2], ip[3] | ~mask[3]);
+static void peerForget(uint32_t id) {
+    PeerSession* p = peerFind(id);
+    if (p) memset(p, 0, sizeof(PeerSession));
+    PendingPeer* pp = nullptr;
+    for (int i = 0; i < PENDING_MAX; i++)
+        if (g_pending[i].active && g_pending[i].peerID == id) { pp = &g_pending[i]; break; }
+    if (pp) memset(pp, 0, sizeof(PendingPeer));
 }
 
-static void wifiSend(const GPacket& p) {
-    if (!g_wifiReady) return;
-    IPAddress bcast = wifiBroadcast();
-    g_udp.beginPacket(bcast, UDP_DATA_PORT);
-    g_udp.write((const uint8_t*)&p, sizeof(GPacket));
-    g_udp.endPacket();
+static int countEstablished() {
+    int n = 0;
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (peers[i].state == PEER_ESTABLISHED) n++;
+    return n;
 }
 
-static void wifiDataTick() {
-    if (!g_wifiReady) return;
-    int sz = g_udp.parsePacket();
-    if (sz < (int)sizeof(GPacket)) return;
-    GPacket p;
-    int n = g_udp.read((char*)&p, sizeof(GPacket));
-    if (n == (int)sizeof(GPacket) &&
-        p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION) {
-        if (p.senderID != myID) {
-            handleReceivedPacketFromProto(p, PROTO_WIFI);
+static bool isBlocked(uint32_t id) {
+    for (uint8_t i = 0; i < g_blocklist_count; i++)
+        if (g_blocklist[i] == id) return true;
+    return false;
+}
+
+static bool addBlocklist(uint32_t id) {
+    if (isBlocked(id)) return true;
+    if (g_blocklist_count >= BLOCKLIST_MAX) return false;
+    g_blocklist[g_blocklist_count++] = id;
+    return true;
+}
+
+static bool removeBlocklist(uint32_t id) {
+    for (uint8_t i = 0; i < g_blocklist_count; i++) {
+        if (g_blocklist[i] == id) {
+            g_blocklist[i] = g_blocklist[g_blocklist_count - 1];
+            g_blocklist_count--;
+            return true;
         }
     }
+    return false;
 }
 
-// ============================================================================
-// 13. TRASPORTO BLE (GATT server)
-// ============================================================================
-class QorlynBleServerCB : public BLEServerCallbacks {
-    void onConnect(BLEServer*) override {
-        g_bleConnected = true;
-        Serial.println("[BLE] central connected");
-    }
-    void onDisconnect(BLEServer*) override {
-        g_bleConnected = false;
-        Serial.println("[BLE] central disconnected");
-        BLEDevice::startAdvertising();
-    }
-};
-
-class QorlynBleRxCB : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* c) override {
-        std::string v = c->getValue();
-        if (v.length() != sizeof(GPacket)) return;
-        GPacket p;
-        memcpy(&p, v.data(), sizeof(GPacket));
-        if (p.stx != STX_BYTE || p.etx != ETX_BYTE || p.version != G_VERSION) return;
-        if (p.senderID == myID) return;
-        handleReceivedPacketFromProto(p, PROTO_BT);
-    }
-};
-
-static void bleSend(const GPacket& p) {
-    if (!g_btReady || !g_bleConnected || !g_bleTxChar) return;
-    g_bleTxChar->setValue((uint8_t*)&p, sizeof(GPacket));
-    g_bleTxChar->notify();
+static bool isWhitelisted(uint32_t id) {
+    for (uint8_t i = 0; i < g_whitelist_count; i++)
+        if (g_whitelist[i] == id) return true;
+    return false;
 }
 
-static void bleSetup() {
-    BLEDevice::init(BLE_DEVICE_NAME);
-    BLEDevice::setMTU(517);
-    g_bleServer = BLEDevice::createServer();
-    g_bleServer->setCallbacks(new QorlynBleServerCB());
-
-    BLEService* svc = g_bleServer->createService(BLE_SVC_UUID);
-
-    g_bleRxChar = svc->createCharacteristic(BLE_RX_CHAR_UUID,
-        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
-    g_bleRxChar->setCallbacks(new QorlynBleRxCB());
-
-    g_bleTxChar = svc->createCharacteristic(BLE_TX_CHAR_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY);
-    g_bleTxChar->addDescriptor(new BLE2902());
-
-    svc->start();
-
-    BLEAdvertising* adv = BLEDevice::getAdvertising();
-    adv->addServiceUUID(BLE_SVC_UUID);
-    adv->setScanResponse(true);
-    adv->setMinPreferred(0x06);
-    adv->setMinPreferred(0x12);
-    BLEDevice::startAdvertising();
-
-    g_btReady = true;
-    Serial.println("[BLE] ready, advertising");
+static bool addWhitelist(uint32_t id) {
+    if (isWhitelisted(id)) return true;
+    if (g_whitelist_count >= WHITELIST_MAX) return false;
+    g_whitelist[g_whitelist_count++] = id;
+    return true;
 }
 
-// ============================================================================
-// 14. SELEZIONE TRASPORTO
-// ============================================================================
-static ProtoType selectProtoFor(uint32_t target) {
-    // Se conosciamo il peer, rispetta il suo ultimo proto (se disponibile)
-    if (target != BROADCAST_ID) {
-        PeerSession* ps = peerFind(target);
-        if (ps && ps->inUse) {
-            ProtoType pref = (ProtoType)ps->lastSeenProto;
-            if (pref == PROTO_LORA && g_loraReady) return PROTO_LORA;
-            if (pref == PROTO_WIFI && g_wifiReady) return PROTO_WIFI;
-            if (pref == PROTO_BT   && g_btReady && g_bleConnected) return PROTO_BT;
+static bool removeWhitelist(uint32_t id) {
+    for (uint8_t i = 0; i < g_whitelist_count; i++) {
+        if (g_whitelist[i] == id) {
+            g_whitelist[i] = g_whitelist[g_whitelist_count - 1];
+            g_whitelist_count--;
+            return true;
         }
     }
-    // Priorità fissa: LoRa > WiFi > BT
-    if (g_loraReady) return PROTO_LORA;
-    if (g_wifiReady) return PROTO_WIFI;
-    if (g_btReady && g_bleConnected) return PROTO_BT;
-    return PROTO_LORA;  // fallback
+    return false;
 }
 
-static void sendVia(ProtoType proto, const GPacket& p) {
-    switch (proto) {
-        case PROTO_LORA: enqueueTx(p); break;
-        case PROTO_WIFI: wifiSend(p); break;
-        case PROTO_BT:   bleSend(p); break;
-        default:         enqueueTx(p); break;
+static PendingPeer* pendingFind(uint32_t id) {
+    for (int i = 0; i < PENDING_MAX; i++)
+        if (g_pending[i].active && g_pending[i].peerID == id) return &g_pending[i];
+    return nullptr;
+}
+
+static PendingPeer* pendingAlloc() {
+    for (int i = 0; i < PENDING_MAX; i++)
+        if (!g_pending[i].active) return &g_pending[i];
+    return nullptr;
+}
+
+static void pendingFree(uint32_t id) {
+    PendingPeer* p = pendingFind(id);
+    if (p) memset(p, 0, sizeof(PendingPeer));
+}
+
+static void peersSweep() {
+    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
+    unsigned long t = nowMs();
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers[i].state == PEER_NONE) continue;
+        if (peers[i].state == PEER_ESTABLISHED && (t - peers[i].last_activity > 30UL * 60UL * 1000UL)) {
+            memset(&peers[i], 0, sizeof(PeerSession));
+        }
+        if ((peers[i].state == PEER_PENDING_IN || peers[i].state == PEER_PENDING_OUT)
+            && (t - peers[i].last_activity > PENDING_TIMEOUT)) {
+            pendingFree(peers[i].peerID);
+            memset(&peers[i], 0, sizeof(PeerSession));
+        }
     }
-}
-
-static void transmitFrame(GPacket& p) {
-    ProtoType useProto = selectProtoFor(p.targetID);
-    p.originProto = (uint8_t)useProto;
-    sendVia(useProto, p);
+    for (int i = 0; i < PENDING_MAX; i++) {
+        if (g_pending[i].active && (t - g_pending[i].since > PENDING_TIMEOUT))
+            memset(&g_pending[i], 0, sizeof(PendingPeer));
+    }
+    xSemaphoreGiveRecursive(stateMutex);
 }
 
 // ============================================================================
-// 15. HEADER
+// 12. HEADER / OUTGOING
 // ============================================================================
-static GPacket buildHeader(GMessageType type, uint32_t target,
-                           uint8_t totalFrames, uint8_t frameIdx,
-                           uint16_t payloadLen, uint8_t flags,
-                           uint16_t sessionID, uint32_t seq,
-                           uint8_t ttl = DEFAULT_TTL) {
-    GPacket p;
+static void buildHeader(GPacket& p, GMessageType type, uint32_t target,
+                        uint8_t totalFrames, uint8_t frameIdx,
+                        uint16_t payloadLen, uint8_t flags,
+                        uint16_t sessionID, uint32_t seq,
+                        uint8_t ttl = DEFAULT_TTL) {
     memset(&p, 0, sizeof(p));
-    p.stx = STX_BYTE; p.version = G_VERSION; p.flags = flags;
-    p.senderID = myID; p.targetID = target; p.sessionID = sessionID;
-    p.msgType = (uint8_t)type; p.ttl = ttl;
-    p.frameIdx = frameIdx; p.totalFrames = totalFrames;
-    p.payloadLen = payloadLen; p.timestamp = nowMs() / 1000;
-    p.seq = seq; p.originProto = PROTO_LORA; p.etx = ETX_BYTE;
-    return p;
+    p.stx = STX_BYTE;
+    p.version = G_VERSION;
+    p.flags = flags;
+    p.senderID = myID;
+    p.targetID = target;
+    p.sessionID = sessionID;
+    p.msgType = (uint8_t)type;
+    p.ttl = ttl;
+    p.frameIdx = frameIdx;
+    p.totalFrames = totalFrames;
+    p.payloadLen = payloadLen;
+    p.timestamp = nowMs() / 1000;
+    p.seq = seq;
+    p.originProto = PROTO_LORA;
+    p.etx = ETX_BYTE;
 }
 
-// ============================================================================
-// 16. OUTGOING
-// ============================================================================
 static OutgoingMessage* outgoingAlloc() {
     for (int i = 0; i < MAX_OUTGOING; i++)
         if (!outgoing[i].active) return &outgoing[i];
     return nullptr;
 }
 
-static void outgoingFree(OutgoingMessage* o) {
-    if (o) memset(o, 0, sizeof(OutgoingMessage));
-}
+static void outgoingFree(OutgoingMessage* o) { if (o) memset(o, 0, sizeof(OutgoingMessage)); }
+
+// Forward
+static void transmitFrame(GPacket& p);
+static bool enqueueTx(const GPacket& p);
 
 static bool sendFrameOfOutgoing(OutgoingMessage* o, uint8_t idx) {
-    GPacket p = buildHeader((GMessageType)o->msgType, o->targetID,
-                            o->totalFrames, idx, o->frameLens[idx],
-                            o->flags, o->sessionID, g_sessionCounter++, DEFAULT_TTL);
+    GPacket p;
+    buildHeader(p, (GMessageType)o->msgType, o->targetID,
+                o->totalFrames, idx, o->frameLens[idx], o->flags,
+                o->sessionID, g_sessionCounter++, DEFAULT_TTL);
     memcpy(p.payload, o->frameData[idx], o->frameLens[idx]);
     transmitFrame(p);
     return true;
@@ -736,15 +814,10 @@ static bool sendFrameOfOutgoing(OutgoingMessage* o, uint8_t idx) {
 static void outgoingStart(GMessageType type, uint32_t target,
                           const uint8_t* data, uint16_t len,
                           uint8_t extraFlags, bool needAck = true) {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
     OutgoingMessage* o = outgoingAlloc();
-    if (!o) { Serial.println("[TX] outgoing full"); xSemaphoreGiveRecursive(stateMutex); return; }
-
+    if (!o) { Serial.println("[TX] outgoing full"); return; }
     uint8_t totalFrames = (len == 0) ? 1 : ((len + FRAME_PAYLOAD - 1) / FRAME_PAYLOAD);
-    if (totalFrames > MAX_FRAMES) {
-        Serial.println("[TX] msg too long");
-        xSemaphoreGiveRecursive(stateMutex); return;
-    }
+    if (totalFrames > MAX_FRAMES) { Serial.println("[TX] msg too long"); return; }
 
     memset(o, 0, sizeof(OutgoingMessage));
     o->active = true;
@@ -756,60 +829,45 @@ static void outgoingStart(GMessageType type, uint32_t target,
     else if (needAck) o->flags |= FLAG_ACK_REQ;
     o->totalFrames = totalFrames;
     o->retries = 0;
-
     for (uint8_t i = 0; i < totalFrames; i++) {
         uint16_t off = i * FRAME_PAYLOAD;
         uint16_t l = (len - off > FRAME_PAYLOAD) ? FRAME_PAYLOAD : (len - off);
         o->frameLens[i] = l;
         if (data) memcpy(o->frameData[i], data + off, l);
     }
-
     for (uint8_t i = 0; i < totalFrames; i++) sendFrameOfOutgoing(o, i);
     o->lastSend = nowMs();
-    xSemaphoreGiveRecursive(stateMutex);
 }
 
 static void outgoingHandleAck(uint32_t sender, uint16_t session, uint8_t ackMask) {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
     for (int i = 0; i < MAX_OUTGOING; i++) {
         OutgoingMessage* o = &outgoing[i];
         if (!o->active || o->sessionID != session || o->targetID != sender) continue;
         o->ackedMask |= ackMask;
         uint8_t need = (1u << o->totalFrames) - 1;
-        if ((o->ackedMask & need) == need) {
-            Serial.printf("[TX] session %u done\n", session);
-            outgoingFree(o);
-        }
+        if ((o->ackedMask & need) == need) outgoingFree(o);
     }
-    xSemaphoreGiveRecursive(stateMutex);
 }
 
 static void outgoingTick() {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
     unsigned long t = nowMs();
     for (int i = 0; i < MAX_OUTGOING; i++) {
         OutgoingMessage* o = &outgoing[i];
         if (!o->active) continue;
         if (t - o->lastSend < ACK_TIMEOUT_MS) continue;
-
         if (o->flags & FLAG_NO_RETRY) { outgoingFree(o); continue; }
-
         uint8_t need = (1u << o->totalFrames) - 1;
         uint8_t missing = need & ~o->ackedMask;
-        if (o->retries >= ACK_MAX_RETRIES) {
-            Serial.printf("[TX] session %u timeout\n", o->sessionID);
-            outgoingFree(o); continue;
-        }
+        if (o->retries >= ACK_MAX_RETRIES) { outgoingFree(o); continue; }
         o->retries++;
         for (uint8_t f = 0; f < o->totalFrames; f++)
             if (missing & (1u << f)) sendFrameOfOutgoing(o, f);
         o->lastSend = t;
     }
-    xSemaphoreGiveRecursive(stateMutex);
 }
 
 // ============================================================================
-// 17. REASSEMBLY
+// 13. REASSEMBLY
 // ============================================================================
 static IncomingMessage* rxSlotFor(const GPacket& p, bool create) {
     for (int i = 0; i < RX_SLOT_COUNT; i++)
@@ -831,12 +889,10 @@ static IncomingMessage* rxSlotFor(const GPacket& p, bool create) {
 }
 
 static void rxSlotsSweep() {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
     unsigned long t = nowMs();
     for (int i = 0; i < RX_SLOT_COUNT; i++)
         if (rxSlots[i].active && (t - rxSlots[i].lastUpdate) > RX_SESSION_TIMEOUT)
             memset(&rxSlots[i], 0, sizeof(IncomingMessage));
-    xSemaphoreGiveRecursive(stateMutex);
 }
 
 static void sendAckBitmap(uint32_t target, uint16_t session, uint8_t mask) {
@@ -846,8 +902,9 @@ static void sendAckBitmap(uint32_t target, uint16_t session, uint8_t mask) {
     payload[1] = session & 0xFF;
     payload[2] = mask;
     payload[3] = 0;
-    GPacket p = buildHeader(MSG_ACK, target, 1, 0, 4, 0,
-                            ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+    GPacket p;
+    buildHeader(p, MSG_ACK, target, 1, 0, 4, 0,
+                ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
     memcpy(p.payload, payload, 4);
     transmitFrame(p);
 }
@@ -883,17 +940,409 @@ static void handlePacketReassembly(GPacket& p) {
 }
 
 // ============================================================================
-// 18. ONION TRACKER
+// 14. TRASPORTO LoRa
 // ============================================================================
-static void onionTrackerSweep() {
-    unsigned long t = nowMs();
-    for (int i = 0; i < ONION_TRACKER_SIZE; i++) {
-        if (g_onionTrackers[i].active && (t - g_onionTrackers[i].sentAt) > ONION_TRACKER_TTL) {
-            Serial.printf("[ONION] ACK timeout token=%08X target=%08X\n",
-                          g_onionTrackers[i].token, g_onionTrackers[i].targetID);
-            g_onionTrackers[i].active = false;
+static void radioTransmitBlocking(const GPacket& p) {
+    uint32_t start = nowMs();
+    while (digitalRead(LORA_BUSY) == HIGH && (nowMs() - start) < 500) delay(1);
+    radio.standby();
+    delay(20);
+    int st = radio.transmit((uint8_t*)&p, sizeof(GPacket));
+    if (st != RADIOLIB_ERR_NONE) Serial.printf("[TX-LoRa] err=%d\n", st);
+    delay(20);
+    radio.startReceive();
+}
+
+static bool enqueueTx(const GPacket& p) {
+    TxRequest r; r.packet = p;
+    return xQueueSend(txQueue, &r, pdMS_TO_TICKS(500)) == pdTRUE;
+}
+
+static void handleReceivedPacketFromProto(GPacket& p, ProtoType src);
+
+static void radioTask(void*) {
+    TxRequest req;
+    for (;;) {
+        while (xQueueReceive(txQueue, &req, 0) == pdTRUE)
+            radioTransmitBlocking(req.packet);
+
+        GPacket p;
+        int st = radio.receive((uint8_t*)&p, sizeof(GPacket), 100);
+        if (st == RADIOLIB_ERR_NONE) {
+            if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION)
+                handleReceivedPacketFromProto(p, PROTO_LORA);
+            else crc_error_count++;
+        } else if (st == RADIOLIB_ERR_CROSS_MISMATCH) {
+            // unreachable, silence
+        } else if (st == RADIOLIB_ERR_CRC_MISMATCH) {
+            crc_error_count++;
+        }
+        recalcInterference();
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+// ============================================================================
+// 15. TRASPORTO WiFi (STA + AP + discovery)
+// ============================================================================
+static IPAddress wifiBroadcastFor(IPAddress ip, IPAddress mask) {
+    return IPAddress(ip[0] | ~mask[0], ip[1] | ~mask[1],
+                     ip[2] | ~mask[2], ip[3] | ~mask[3]);
+}
+
+static void wifiSend(const GPacket& p) {
+    if (!g_wifiReady) return;
+    // STA broadcast
+    if (WiFi.status() == WL_CONNECTED) {
+        IPAddress b = wifiBroadcastFor(WiFi.localIP(), WiFi.subnetMask());
+        g_udp.beginPacket(b, UDP_DATA_PORT);
+        g_udp.write((const uint8_t*)&p, sizeof(GPacket));
+        g_udp.endPacket();
+    }
+    // AP broadcast (client collegati al nostro AP)
+    if (WiFi.getMode() & WIFI_MODE_AP) {
+        IPAddress b = wifiBroadcastFor(WiFi.softAPIP(), IPAddress(255,255,255,0));
+        g_udp.beginPacket(b, UDP_DATA_PORT);
+        g_udp.write((const uint8_t*)&p, sizeof(GPacket));
+        g_udp.endPacket();
+    }
+}
+
+static void wifiDataTick() {
+    if (!g_wifiReady) return;
+    int sz = g_udp.parsePacket();
+    if (sz < (int)sizeof(GPacket)) return;
+    GPacket p;
+    int n = g_udp.read((char*)&p, sizeof(GPacket));
+    if (n == (int)sizeof(GPacket) &&
+        p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION) {
+        if (p.senderID != myID) handleReceivedPacketFromProto(p, PROTO_WIFI);
+    }
+}
+
+static void wifiSetupTask(void*) {
+    // Modalità duale: STA verso rete esterna, AP locale per Web UI
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+
+    // Discovery: cerca reti QORLYN-* e unisciti a quella con miglior segnale
+    char mySSID[24];
+    sprintf(mySSID, "%s%08X", WIFI_SSID_PREFIX, myID);
+
+    Serial.println("[WiFi] scan...");
+    int n = WiFi.scanNetworks();
+    String bestSSID;
+    int bestRSSI = -1000;
+    for (int i = 0; i < n; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.startsWith(WIFI_SSID_PREFIX) && ssid != mySSID) {
+            if (WiFi.RSSI(i) > bestRSSI) {
+                bestRSSI = WiFi.RSSI(i);
+                bestSSID = ssid;
+            }
         }
     }
+    WiFi.scanDelete();
+
+    if (bestSSID.length() > 0) {
+        Serial.printf("[WiFi] join %s (rssi=%d)\n", bestSSID.c_str(), bestRSSI);
+        WiFi.begin(bestSSID.c_str(), WIFI_PASSWORD);
+        unsigned long start = nowMs();
+        while (WiFi.status() != WL_CONNECTED && (nowMs() - start) < WIFI_STA_TIMEOUT_MS) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[WiFi] STA OK ip=%s\n", WiFi.localIP().toString().c_str());
+        } else {
+            Serial.println("[WiFi] STA fail, solo AP");
+            WiFi.disconnect();
+        }
+    } else {
+        Serial.println("[WiFi] nessuna QORLYN trovata, solo AP");
+    }
+
+    // AP sempre attivo per Web UI locale
+    WiFi.softAP(mySSID, WIFI_PASSWORD);
+    Serial.printf("[WiFi] AP %s -> %s\n", mySSID, WiFi.softAPIP().toString().c_str());
+
+    g_udp.begin(UDP_DATA_PORT);
+    g_wifiReady = true;
+    Serial.printf("[WiFi] UDP data port %d ready\n", UDP_DATA_PORT);
+
+    vTaskDelete(NULL);
+}
+
+// ============================================================================
+// 16. TRASPORTO BLE (peripheral + central)
+// ============================================================================
+class QorlynBleServerCB : public BLEServerCallbacks {
+    void onConnect(BLEServer*) override {
+        g_bleCentralConnected = true;
+        Serial.println("[BLE] central connected");
+    }
+    void onDisconnect(BLEServer*) override {
+        g_bleCentralConnected = false;
+        Serial.println("[BLE] central disconnected");
+        BLEDevice::startAdvertising();
+    }
+};
+
+static void bleHandleIncoming(const uint8_t* data, size_t len);
+
+class QorlynBleRxCB : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* c) override {
+        std::string v = c->getValue();
+        if (v.length() < 1) return;
+        bleHandleIncoming((const uint8_t*)v.data(), v.length());
+    }
+};
+
+static void bleSendPeripheral(const uint8_t* data, size_t len) {
+    if (!g_bleReady_check()) return;
+    if (!g_bleCentralConnected || !g_bleTxChar) return;
+    // Chunking se len > BLE_MTU_PAYLOAD
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > BLE_MTU_PAYLOAD) chunk = BLE_MTU_PAYLOAD;
+        g_bleTxChar->setValue((uint8_t*)(data + off), chunk);
+        g_bleTxChar->notify();
+        off += chunk;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+static bool g_bleReady_check() { return g_btReady; }
+
+// Ble central: notifiche dai peripheral connessi
+static void bleCentralNotifyCB(BLERemoteCharacteristic* c, uint8_t* data, size_t len, bool isNotify) {
+    (void)c; (void)isNotify;
+    bleHandleIncoming(data, len);
+}
+
+static void bleCentralScanTask(void*) {
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(BLE_SCAN_INTERVAL_MS));
+        if (!g_btReady) continue;
+
+        // Conta link attivi
+        int active = 0;
+        for (int i = 0; i < BLE_MAX_CENTRALS; i++) if (g_bleCentrals[i].active) active++;
+        if (active >= BLE_MAX_CENTRALS) continue;
+
+        BLEScan* scan = BLEDevice::getScan();
+        scan->setActiveScan(true);
+        BLEScanResults res = scan->start(3, false);
+
+        for (int i = 0; i < res.getCount(); i++) {
+            BLEAdvertisedDevice dev = res.getDevice(i);
+            if (!dev.haveName()) continue;
+            String name = dev.getName().c_str();
+            if (!name.startsWith(BLE_DEVICE_PREFIX)) continue;
+
+            // Estrai ID dal nome "QORLYN-XXXXXXXX"
+            int dash = name.lastIndexOf('-');
+            if (dash < 0) continue;
+            uint32_t peerID = strtoul(name.substring(dash + 1).c_str(), nullptr, 16);
+            if (peerID == 0 || peerID == myID) continue;
+
+            // Già connesso?
+            bool dup = false;
+            for (int j = 0; j < BLE_MAX_CENTRALS; j++)
+                if (g_bleCentrals[j].active && g_bleCentrals[j].peerID == peerID) { dup = true; break; }
+            if (dup) continue;
+
+            // Trova slot libero
+            int slot = -1;
+            for (int j = 0; j < BLE_MAX_CENTRALS; j++)
+                if (!g_bleCentrals[j].active) { slot = j; break; }
+            if (slot < 0) break;
+
+            Serial.printf("[BLE] connecting to %s\n", name.c_str());
+            BLEClient* cli = BLEDevice::createClient();
+            if (!cli->connect(&dev)) {
+                Serial.println("[BLE] connect fail");
+                delete cli;
+                continue;
+            }
+            BLERemoteService* svc = cli->getService(BLE_SVC_UUID);
+            if (!svc) { cli->disconnect(); delete cli; continue; }
+            BLERemoteCharacteristic* txr = svc->getCharacteristic(BLE_TX_CHAR_UUID);
+            BLERemoteCharacteristic* rxr = svc->getCharacteristic(BLE_RX_CHAR_UUID);
+            if (!txr || !rxr) { cli->disconnect(); delete cli; continue; }
+            if (txr->canNotify()) txr->registerForNotify(bleCentralNotifyCB);
+
+            g_bleCentrals[slot].active = true;
+            g_bleCentrals[slot].client = cli;
+            g_bleCentrals[slot].txChar = txr;
+            g_bleCentrals[slot].rxChar = rxr;
+            g_bleCentrals[slot].peerID = peerID;
+            g_bleCentrals[slot].lastSeen = nowMs();
+            Serial.printf("[BLE] central linked to %08X\n", peerID);
+        }
+    }
+}
+
+static void bleSetup() {
+    BLEDevice::init(BLE_DEVICE_NAME_UNIQUE);  // vedi macro sotto
+    BLEDevice::setMTU(517);
+    g_bleServer = BLEDevice::createServer();
+    g_bleServer->setCallbacks(new QorlynBleServerCB());
+
+    BLEService* svc = g_bleServer->createService(BLE_SVC_UUID);
+
+    g_bleRxChar = svc->createCharacteristic(BLE_RX_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    g_bleRxChar->setCallbacks(new QorlynBleRxCB());
+
+    g_bleTxChar = svc->createCharacteristic(BLE_TX_CHAR_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY);
+    g_bleTxChar->addDescriptor(new BLE2902());
+
+    svc->start();
+
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(BLE_SVC_UUID);
+    adv->setScanResponse(true);
+    BLEDevice::startAdvertising();
+
+    g_btReady = true;
+    Serial.println("[BLE] peripheral ready");
+
+    xTaskCreatePinnedToCore(bleCentralScanTask, "bleScan", 4096, nullptr, 1, &bleTaskHandle, 0);
+}
+
+// ============================================================================
+// 17. BLE chunking (peripheral + central in ingresso)
+// ============================================================================
+// I pacchetti BLE possono arrivare chunked. Buffer di riassemblaggio.
+static uint8_t  s_bleRxBuf[sizeof(GPacket) * 2];
+static size_t   s_bleRxLen = 0;
+
+static void bleHandleIncoming(const uint8_t* data, size_t len) {
+    // Strategia semplice: se len == sizeof(GPacket), è un pacchetto completo
+    // Altrimenti accumula in s_bleRxBuf fino a sizeof(GPacket).
+    if (len == sizeof(GPacket)) {
+        GPacket p;
+        memcpy(&p, data, sizeof(GPacket));
+        if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION
+            && p.senderID != myID) {
+            handleReceivedPacketFromProto(p, PROTO_BT);
+        }
+        return;
+    }
+    // Chunked (raro): accumula
+    if (s_bleRxLen + len <= sizeof(s_bleRxBuf)) {
+        memcpy(s_bleRxBuf + s_bleRxLen, data, len);
+        s_bleRxLen += len;
+        if (s_bleRxLen >= sizeof(GPacket)) {
+            GPacket p;
+            memcpy(&p, s_bleRxBuf, sizeof(GPacket));
+            s_bleRxLen = 0;
+            if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION
+                && p.senderID != myID) {
+                handleReceivedPacketFromProto(p, PROTO_BT);
+            }
+        }
+    } else {
+        s_bleRxLen = 0;  // overflow, resetta
+    }
+}
+
+static void bleSend(const GPacket& p) {
+    if (!g_btReady) return;
+    // Verso il peripheral (central connesso a noi)
+    if (g_bleCentralConnected && g_bleTxChar) {
+        bleSendPeripheral((const uint8_t*)&p, sizeof(GPacket));
+    }
+    // Verso central (noi connessi come central a un peripheral)
+    for (int i = 0; i < BLE_MAX_CENTRALS; i++) {
+        if (!g_bleCentrals[i].active) continue;
+        // Preferisci il link il cui peerID == target del pacchetto
+        if (p.targetID != BROADCAST_ID && g_bleCentrals[i].peerID != p.targetID) continue;
+        BLERemoteCharacteristic* rxr = g_bleCentrals[i].rxChar;
+        if (!rxr) continue;
+        // Scrittura chunked
+        size_t off = 0;
+        while (off < sizeof(GPacket)) {
+            size_t chunk = sizeof(GPacket) - off;
+            if (chunk > BLE_MTU_PAYLOAD) chunk = BLE_MTU_PAYLOAD;
+            rxr->writeValue((uint8_t*)((const uint8_t*)&p + off), chunk, false);
+            off += chunk;
+        }
+        g_bleCentrals[i].lastSeen = nowMs();
+        if (p.targetID != BROADCAST_ID) return;  // inviato al target specifico
+    }
+}
+
+// ============================================================================
+// 18. SELEZIONE TRASPORTO + BRIDGING
+// ============================================================================
+static bool protoReady(ProtoType p) {
+    switch (p) {
+        case PROTO_LORA: return g_loraReady;
+        case PROTO_WIFI: return g_wifiReady;
+        case PROTO_BT:   return g_btReady && (g_bleCentralConnected || g_bleCentrals[0].active || g_bleCentrals[1].active);
+    }
+    return false;
+}
+
+static ProtoType selectProtoFor(uint32_t target) {
+    // Preferenza: proto su cui abbiamo visto il peer l'ultima volta
+    if (target != BROADCAST_ID) {
+        PeerSession* ps = peerFind(target);
+        if (ps && ps->state != PEER_NONE) {
+            ProtoType pref = (ProtoType)ps->lastSeenProto;
+            if (protoReady(pref)) return pref;
+        }
+    }
+    // Priorità fissa, mai un proto non ready
+    if (g_loraReady) return PROTO_LORA;
+    if (g_wifiReady) return PROTO_WIFI;
+    if (protoReady(PROTO_BT)) return PROTO_BT;
+    return PROTO_LORA;  // fallback assoluto (verrà loggato)
+}
+
+static void sendVia(ProtoType proto, const GPacket& p) {
+    switch (proto) {
+        case PROTO_LORA: enqueueTx(p); break;
+        case PROTO_WIFI: wifiSend(p); break;
+        case PROTO_BT:   bleSend(p); break;
+    }
+}
+
+static void transmitFrame(GPacket& p) {
+    ProtoType useProto = selectProtoFor(p.targetID);
+    p.originProto = (uint8_t)useProto;
+    if (!protoReady(useProto)) {
+        Serial.printf("[TX] proto %s non ready\n", protoName(useProto));
+    }
+    sendVia(useProto, p);
+}
+
+// ============================================================================
+// 19. ONION ROUTING (X25519 effimero per-hop)
+// ----------------------------------------------------------------------------
+// Layer (dopo eph_pub):  [next_hop:4][type:1][flags:1][len:2][inner:len]
+//
+// Struttura del pacchetto onion inviato al primo hop:
+//   [eph_pub:32][iv:12][tag:16][ciphertext]
+//   ciphertext = AES-GCM(K = ECDH(sk_eph, pk_H1), layer_1_plaintext)
+//
+// Ogni hop H(i) riceve [eph_pub][iv][tag][ct]. Calcola K = ECDH(sk_Hi, eph_pub).
+// Decifra. Se next_hop == 0 è il destinatario, altrimenti forwarda a next_hop
+// con senderID = H(i) (non l'originatore!).
+//
+// Nessun hop vede l'originatore, tranne il primo hop che vede il mittente
+// diretto (perché è lui che ha ricevuto il pacchetto). L'originatore S
+// è visibile solo a H1, non a H2..Hn. Questo è il modello Tor.
+// ============================================================================
+
+static void onionTrackerSweep() {
+    unsigned long t = nowMs();
+    for (int i = 0; i < ONION_TRACKER_SIZE; i++)
+        if (g_onionTrackers[i].active && (t - g_onionTrackers[i].sentAt) > ONION_TRACKER_TTL)
+            g_onionTrackers[i].active = false;
 }
 
 static uint32_t onionTrackerAdd(uint32_t targetID) {
@@ -903,9 +1352,7 @@ static uint32_t onionTrackerAdd(uint32_t targetID) {
     if (slot < 0) {
         unsigned long oldestT = ULONG_MAX;
         for (int i = 0; i < ONION_TRACKER_SIZE; i++)
-            if (g_onionTrackers[i].sentAt < oldestT) {
-                oldestT = g_onionTrackers[i].sentAt; slot = i;
-            }
+            if (g_onionTrackers[i].sentAt < oldestT) { oldestT = g_onionTrackers[i].sentAt; slot = i; }
     }
     uint32_t token;
     do { token = esp_random(); } while (token == 0);
@@ -926,295 +1373,430 @@ static bool onionTrackerConsume(uint32_t token) {
     return false;
 }
 
-// ============================================================================
-// 19. ONION ROUTING
-// ============================================================================
-static void buildOnionAAD(uint32_t origSender, uint32_t thisHop,
-                          uint8_t* aad, size_t& aadLen) {
-    size_t i = 0;
-    aad[i++] = G_VERSION;
-    memcpy(aad + i, &origSender, 4); i += 4;
-    memcpy(aad + i, &thisHop, 4);    i += 4;
-    aadLen = i;
-}
-
 static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
                                    uint8_t* data, uint16_t len,
                                    bool ackReq, uint32_t ackToken);
 
-static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
+// Costruisci UN layer per Hi: encrypt ( plaintext ) con K = ECDH(eph_sk, pk_Hi)
+// eph_pub viene prepended al ciphertext.
+static bool onionBuildLayer(const uint8_t* hop_pk,
+                            const uint8_t* plaintext, uint16_t ptLen,
+                            uint8_t* out, uint16_t& outLen) {
+    if (ptLen + ONION_LAYER_OVERHEAD > ONION_BUF) return false;
+    uint8_t eph_sk[X25519_KEY_SIZE];
+    uint8_t eph_pk[X25519_KEY_SIZE];
+    if (!x25519GenKeypair(eph_sk, eph_pk)) return false;
+    uint8_t K[32];
+    if (!x25519Shared(eph_sk, hop_pk, K)) return false;
 
-    PeerSession* ps = peerFind(origSender);
-    if (!ps || !ps->established) {
-        Serial.printf("[ONION] no session with %08X\n", origSender);
-        xSemaphoreGiveRecursive(stateMutex); return;
-    }
+    // AAD = eph_pub per legare il ciphertext alla chiave effimera
+    uint8_t aad[X25519_KEY_SIZE];
+    memcpy(aad, eph_pk, X25519_KEY_SIZE);
 
-    uint16_t plainLen = 0;
-    uint8_t aad[ONION_AAD_LEN]; size_t aadLen;
-    buildOnionAAD(origSender, myID, aad, aadLen);
-    if (!gcmDecryptAAD(ps->shared_secret, aad, aadLen,
-                       data, len, s_onionPlain, plainLen)) {
-        Serial.println("[ONION] decrypt fail");
-        xSemaphoreGiveRecursive(stateMutex); return;
-    }
-    if (plainLen < ONION_LAYER_HDR) {
-        xSemaphoreGiveRecursive(stateMutex); return;
-    }
+    uint8_t ct[ONION_BUF];
+    uint16_t ctLen = 0;
+    if (!x25519Encrypt(K, aad, X25519_KEY_SIZE, plaintext, ptLen, ct, ctLen)) return false;
 
-    uint32_t nextHop = ((uint32_t)s_onionPlain[0] << 24) | ((uint32_t)s_onionPlain[1] << 16)
-                     | ((uint32_t)s_onionPlain[2] <<  8) |  (uint32_t)s_onionPlain[3];
-    uint8_t  nextType = s_onionPlain[4];
-    uint8_t  nextFlags= s_onionPlain[5];
-    uint16_t nextLen  = ((uint16_t)s_onionPlain[6] << 8) | s_onionPlain[7];
-    uint8_t* nextData = s_onionPlain + ONION_LAYER_HDR;
-
-    if (nextLen > plainLen - ONION_LAYER_HDR) {
-        Serial.println("[ONION] len mismatch");
-        xSemaphoreGiveRecursive(stateMutex); return;
-    }
-
-    memmove(s_onionB, nextData, nextLen);
-
-    if (nextHop == 0) {
-        if (nextType == MSG_ONION || nextType == MSG_ACK || nextType == MSG_ONION_ACK) {
-            Serial.printf("[ONION] inner type forbidden 0x%02X\n", nextType);
-            xSemaphoreGiveRecursive(stateMutex); return;
-        }
-        bool ackReq = (nextFlags & ONION_FLAG_ACK_REQ) != 0;
-        uint32_t ackToken = 0;
-        uint8_t* userData = s_onionB;
-        uint16_t userLen = nextLen;
-
-        if (ackReq) {
-            if (nextLen < ONION_TOKEN_LEN) {
-                xSemaphoreGiveRecursive(stateMutex); return;
-            }
-            ackToken = ((uint32_t)s_onionB[0] << 24) | ((uint32_t)s_onionB[1] << 16)
-                     | ((uint32_t)s_onionB[2] <<  8) |  (uint32_t)s_onionB[3];
-            userData = s_onionB + ONION_TOKEN_LEN;
-            userLen  = nextLen - ONION_TOKEN_LEN;
-        }
-        dispatchOnionDelivered(origSender, nextType, userData, userLen, ackReq, ackToken);
-        Serial.printf("[ONION] final delivered from %08X len=%u ack=%d\n",
-                      origSender, userLen, ackReq ? 1 : 0);
-    } else {
-        if (nextType != MSG_ONION) {
-            xSemaphoreGiveRecursive(stateMutex); return;
-        }
-        // Relay via stesso proto d'ingresso per coerenza
-        GPacket fwd = buildHeader(MSG_ONION, nextHop, 1, 0, nextLen,
-                                  FLAG_RELAY_OK | FLAG_NO_RETRY,
-                                  ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
-        fwd.senderID = origSender;
-        fwd.flags &= ~FLAG_ACK_REQ;
-        memcpy(fwd.payload, s_onionB, nextLen);
-        ProtoType src = (ProtoType)g_lastRxProto;
-        fwd.originProto = (uint8_t)src;
-        sendVia(src, fwd);
-        Serial.printf("[ONION] relay -> %08X via %s (%u B)\n",
-                      nextHop, protoName(src), nextLen);
-    }
-
-    xSemaphoreGiveRecursive(stateMutex);
+    memcpy(out, eph_pk, X25519_KEY_SIZE);
+    memcpy(out + X25519_KEY_SIZE, ct, ctLen);
+    outLen = X25519_KEY_SIZE + ctLen;
+    return true;
 }
 
 static bool onionSend(GMessageType finalType, uint32_t target,
                       const uint8_t* data, uint16_t dataLen,
                       const uint32_t* hops, uint8_t nHops,
                       bool ackReq) {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return false;
-
     uint8_t pathLen = nHops + 1;
-    if (pathLen > ONION_MAX_HOPS) {
-        xSemaphoreGiveRecursive(stateMutex); return false;
-    }
+    if (pathLen > ONION_MAX_HOPS) return false;
 
     uint32_t path[ONION_MAX_HOPS];
     for (uint8_t i = 0; i < nHops; i++) path[i] = hops[i];
     path[nHops] = target;
 
+    // Verifica che ogni hop abbia x25519_pk noto
     for (uint8_t i = 0; i < pathLen; i++) {
-        if (path[i] == BROADCAST_ID) {
-            xSemaphoreGiveRecursive(stateMutex); return false;
-        }
+        if (path[i] == BROADCAST_ID) return false;
         PeerSession* ps = peerFind(path[i]);
-        if (!ps || !ps->established) {
-            Serial.printf("[ONION] no session with %08X\n", path[i]);
-            xSemaphoreGiveRecursive(stateMutex); return false;
+        if (!ps || !ps->has_x25519_pk) {
+            Serial.printf("[ONION] no x25519 pk for %08X\n", path[i]);
+            return false;
         }
     }
 
-    uint16_t overhead = ONION_LAYER_OVERHEAD * pathLen + (ackReq ? ONION_TOKEN_LEN : 0);
-    if (dataLen + overhead > MAX_MESSAGE_BYTES) {
-        xSemaphoreGiveRecursive(stateMutex); return false;
-    }
+    uint16_t overhead = ONION_LAYER_OVERHEAD * pathLen + ONION_INNER_HDR;
+    if (dataLen + overhead > MAX_MESSAGE_BYTES) return false;
 
     uint32_t ackToken = ackReq ? onionTrackerAdd(target) : 0;
 
-    uint16_t bufLen = 0;
-    uint8_t* cur = s_onionA;
-    uint8_t* nxt = s_onionB;
-
+    // Layer innermost (per il destinatario finale)
+    // plaintext: [next=0][type][flags][len][origin_id][token][payload]
     {
         uint16_t i = 0;
-        nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0;
-        nxt[i++] = (uint8_t)finalType;
-        nxt[i++] = ackReq ? ONION_FLAG_ACK_REQ : 0;
-        uint16_t innerLen = (ackReq ? ONION_TOKEN_LEN : 0) + dataLen;
-        nxt[i++] = (innerLen >> 8) & 0xFF;
-        nxt[i++] = innerLen & 0xFF;
-        if (ackReq) {
-            nxt[i++] = (ackToken >> 24) & 0xFF;
-            nxt[i++] = (ackToken >> 16) & 0xFF;
-            nxt[i++] = (ackToken >>  8) & 0xFF;
-            nxt[i++] = (ackToken      ) & 0xFF;
-        }
-        if (dataLen) { memcpy(nxt + i, data, dataLen); i += dataLen; }
+        uint16_t innerLen = ONION_INNER_HDR + dataLen;
+        uint8_t p0[ONION_BUF];
+        p0[i++] = 0; p0[i++] = 0; p0[i++] = 0; p0[i++] = 0;  // next_hop = 0
+        p0[i++] = (uint8_t)finalType;
+        p0[i++] = ackReq ? ONION_FLAG_ACK_REQ : 0;
+        p0[i++] = (innerLen >> 8) & 0xFF;
+        p0[i++] = innerLen & 0xFF;
+        // origin_id = S (myID)
+        p0[i++] = (myID >> 24) & 0xFF;
+        p0[i++] = (myID >> 16) & 0xFF;
+        p0[i++] = (myID >>  8) & 0xFF;
+        p0[i++] = (myID      ) & 0xFF;
+        // token (0 se non richiesto)
+        p0[i++] = (ackToken >> 24) & 0xFF;
+        p0[i++] = (ackToken >> 16) & 0xFF;
+        p0[i++] = (ackToken >>  8) & 0xFF;
+        p0[i++] = (ackToken      ) & 0xFF;
+        if (dataLen) { memcpy(p0 + i, data, dataLen); i += dataLen; }
 
         PeerSession* tps = peerFind(target);
-        uint8_t aad[ONION_AAD_LEN]; size_t aadLen;
-        buildOnionAAD(myID, target, aad, aadLen);
-        uint16_t outLen;
-        if (!gcmEncryptAAD(tps->shared_secret, aad, aadLen, nxt, i, cur, outLen)) {
-            xSemaphoreGiveRecursive(stateMutex); return false;
+        uint16_t curLen = 0;
+        if (!onionBuildLayer(tps->x25519_pk, p0, i, s_onionA, curLen)) return false;
+        // ora s_onionA contiene il layer per il target
+        uint16_t bufLen = curLen;
+        uint8_t* cur = s_onionA;
+        uint8_t* nxt = s_onionB;
+
+        // Layer intermedi: dal più interno (nHops-1) al più esterno (0)
+        for (int k = (int)nHops - 1; k >= 0; k--) {
+            PeerSession* ps = peerFind(path[k]);
+            uint32_t nextHop = path[k + 1];
+
+            uint8_t plain[ONION_BUF];
+            uint16_t j = 0;
+            plain[j++] = (nextHop >> 24) & 0xFF;
+            plain[j++] = (nextHop >> 16) & 0xFF;
+            plain[j++] = (nextHop >>  8) & 0xFF;
+            plain[j++] = (nextHop      ) & 0xFF;
+            plain[j++] = (uint8_t)MSG_ONION;
+            plain[j++] = 0;
+            plain[j++] = (bufLen >> 8) & 0xFF;
+            plain[j++] = bufLen & 0xFF;
+            memcpy(plain + j, cur, bufLen); j += bufLen;
+
+            uint16_t outLen = 0;
+            if (!onionBuildLayer(ps->x25519_pk, plain, j, nxt, outLen)) return false;
+            // swap cur/nxt
+            uint8_t* t = cur; cur = nxt; nxt = t;
+            bufLen = outLen;
         }
-        bufLen = outLen;
+
+        Serial.printf("[ONION] send path=%u target=%08X len=%u ack=%d\n",
+                      pathLen, target, bufLen, ackReq ? 1 : 0);
+
+        // Invia cur al primo hop (path[0] se nHops>0, altrimenti target)
+        uint32_t firstHop = (nHops > 0) ? path[0] : target;
+        outgoingStart(MSG_ONION, firstHop, cur, bufLen,
+                      FLAG_RELAY_OK | FLAG_NO_RETRY, false);
     }
-
-    for (int i = (int)nHops - 1; i >= 0; i--) {
-        PeerSession* ps = peerFind(path[i]);
-        uint32_t nextHop = path[i + 1];
-
-        uint16_t j = 0;
-        nxt[j++] = (nextHop >> 24) & 0xFF;
-        nxt[j++] = (nextHop >> 16) & 0xFF;
-        nxt[j++] = (nextHop >>  8) & 0xFF;
-        nxt[j++] = (nextHop      ) & 0xFF;
-        nxt[j++] = (uint8_t)MSG_ONION;
-        nxt[j++] = 0;
-        nxt[j++] = (bufLen >> 8) & 0xFF;
-        nxt[j++] = bufLen & 0xFF;
-        memcpy(nxt + j, cur, bufLen); j += bufLen;
-
-        uint8_t aad[ONION_AAD_LEN]; size_t aadLen;
-        buildOnionAAD(myID, path[i], aad, aadLen);
-        uint16_t outLen;
-        if (!gcmEncryptAAD(ps->shared_secret, aad, aadLen, nxt, j, cur, outLen)) {
-            xSemaphoreGiveRecursive(stateMutex); return false;
-        }
-        bufLen = outLen;
-    }
-
-    uint32_t firstHop = (nHops > 0) ? path[0] : target;
-    Serial.printf("[ONION] send path=%u target=%08X len=%u ack=%d\n",
-                  pathLen, target, bufLen, ackReq ? 1 : 0);
-
-    // Il primo hop viene scelto in base a selectProtoFor
-    outgoingStart(MSG_ONION, firstHop, cur, bufLen,
-                  FLAG_RELAY_OK | FLAG_NO_RETRY, false);
-
-    xSemaphoreGiveRecursive(stateMutex);
     return true;
 }
 
+static void handleOnionLayer(uint32_t fromHop, uint8_t* data, uint16_t len) {
+    if (!g_x25519_ready) return;
+    if (len < ONION_EPH_PUB + 28) return;
+
+    const uint8_t* eph_pub = data;
+    const uint8_t* ct = data + ONION_EPH_PUB;
+    uint16_t ctLen = len - ONION_EPH_PUB;
+
+    uint8_t K[32];
+    if (!x25519Shared(g_x25519_sk, eph_pub, K)) return;
+
+    uint8_t aad[X25519_KEY_SIZE];
+    memcpy(aad, eph_pub, X25519_KEY_SIZE);
+
+    uint16_t plainLen = 0;
+    if (!x25519Decrypt(K, aad, X25519_KEY_SIZE, ct, ctLen, s_onionPlain, plainLen)) {
+        Serial.println("[ONION] decrypt fail");
+        return;
+    }
+    if (plainLen < ONION_LAYER_HDR) return;
+
+    uint32_t nextHop = ((uint32_t)s_onionPlain[0] << 24) | ((uint32_t)s_onionPlain[1] << 16)
+                     | ((uint32_t)s_onionPlain[2] <<  8) |  (uint32_t)s_onionPlain[3];
+    uint8_t  nextType = s_onionPlain[4];
+    uint8_t  nextFlags = s_onionPlain[5];
+    uint16_t innerLen = ((uint16_t)s_onionPlain[6] << 8) | s_onionPlain[7];
+    uint8_t* inner    = s_onionPlain + ONION_LAYER_HDR;
+    if (innerLen > plainLen - ONION_LAYER_HDR) return;
+
+    if (nextHop == 0) {
+        // Siamo il destinatario finale
+        if (innerLen < ONION_INNER_HDR) return;
+        uint32_t origSender = ((uint32_t)inner[0] << 24) | ((uint32_t)inner[1] << 16)
+                            | ((uint32_t)inner[2] <<  8) |  (uint32_t)inner[3];
+        uint32_t token = ((uint32_t)inner[4] << 24) | ((uint32_t)inner[5] << 16)
+                       | ((uint32_t)inner[6] <<  8) |  (uint32_t)inner[7];
+        bool ackReq = (nextFlags & ONION_FLAG_ACK_REQ) != 0;
+        uint8_t* userData = inner + ONION_INNER_HDR;
+        uint16_t userLen = innerLen - ONION_INNER_HDR;
+
+        if (nextType == MSG_ONION || nextType == MSG_ACK || nextType == MSG_ONION_ACK) return;
+
+        dispatchOnionDelivered(origSender, nextType, userData, userLen, ackReq, token);
+        Serial.printf("[ONION] delivered from %08X len=%u\n", origSender, userLen);
+    } else {
+        // Relay: forward a nextHop, senderID = myID (non l'originatore!)
+        if (nextType != MSG_ONION) return;
+
+        GPacket fwd;
+        buildHeader(fwd, MSG_ONION, nextHop, 1, 0, innerLen,
+                    FLAG_RELAY_OK | FLAG_NO_RETRY,
+                    ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+        // senderID rimane myID (buildHeader lo imposta), NON l'originatore
+        fwd.flags &= ~FLAG_ACK_REQ;
+        memcpy(fwd.payload, inner, innerLen);
+        ProtoType src = (ProtoType)g_lastRxProto;
+        fwd.originProto = (uint8_t)src;
+        sendVia(src, fwd);
+        Serial.printf("[ONION] relay -> %08X via %s (%u B)\n",
+                      nextHop, protoName(src), innerLen);
+    }
+}
+
 // ============================================================================
-// 20. ONION DELIVERY + ACK
+// 20. ONION DELIVERY + ACK end-to-end
 // ============================================================================
 static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
                                    uint8_t* data, uint16_t len,
                                    bool ackReq, uint32_t ackToken) {
-    if (ackReq) {
-        uint8_t ackPayload[ONION_TOKEN_LEN];
-        ackPayload[0] = (ackToken >> 24) & 0xFF;
-        ackPayload[1] = (ackToken >> 16) & 0xFF;
-        ackPayload[2] = (ackToken >>  8) & 0xFF;
-        ackPayload[3] = (ackToken      ) & 0xFF;
+    // Se ACK richiesto: cifra token con X25519 effimero e invia a origSender
+    if (ackReq && g_x25519_ready) {
+        PeerSession* sPeer = peerFind(origSender);
+        if (sPeer && sPeer->has_x25519_pk) {
+            uint8_t eph_sk[X25519_KEY_SIZE];
+            uint8_t eph_pk[X25519_KEY_SIZE];
+            if (x25519GenKeypair(eph_sk, eph_pk)) {
+                uint8_t K[32];
+                if (x25519Shared(eph_sk, sPeer->x25519_pk, K)) {
+                    uint8_t token[4] = {
+                        (uint8_t)(ackToken >> 24), (uint8_t)(ackToken >> 16),
+                        (uint8_t)(ackToken >>  8), (uint8_t)(ackToken      )
+                    };
+                    uint8_t aad[X25519_KEY_SIZE];
+                    memcpy(aad, eph_pk, X25519_KEY_SIZE);
+                    uint8_t ct[64]; uint16_t ctLen = 0;
+                    if (x25519Encrypt(K, aad, X25519_KEY_SIZE, token, 4, ct, ctLen)) {
+                        uint8_t payload[X25519_KEY_SIZE + 64];
+                        memcpy(payload, eph_pk, X25519_KEY_SIZE);
+                        memcpy(payload + X25519_KEY_SIZE, ct, ctLen);
+                        uint16_t plen = X25519_KEY_SIZE + ctLen;
 
-        PeerSession* ps = peerFind(origSender);
-        if (ps && ps->established && ONION_TOKEN_LEN + ENC_OVERHEAD <= FRAME_PAYLOAD) {
-            uint8_t flags = FLAG_RELAY_OK | FLAG_ENCRYPTED;
-            uint16_t sessionID = ++g_sessionCounter;
-            uint32_t seq = ps->tx_seq++;
-            GPacket p = buildHeader(MSG_ONION_ACK, origSender, 1, 0,
-                                    ONION_TOKEN_LEN + ENC_OVERHEAD, flags,
-                                    sessionID, seq, DEFAULT_TTL);
-            uint8_t blob[FRAME_PAYLOAD];
-            uint16_t blobLen = 0;
-            if (encryptGCM_AAD(ps->shared_secret, p, ackPayload, ONION_TOKEN_LEN,
-                               blob, blobLen)) {
-                memcpy(p.payload, blob, blobLen);
-                p.payloadLen = blobLen;
-                transmitFrame(p);
-                Serial.printf("[ONION] ACK inviato a %08X\n", origSender);
+                        GPacket p;
+                        buildHeader(p, MSG_ONION_ACK, origSender, 1, 0, plen,
+                                    FLAG_RELAY_OK | FLAG_X25519_ENC | FLAG_ACK_REQ,
+                                    ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+                        memcpy(p.payload, payload, plen);
+                        transmitFrame(p);
+                        Serial.printf("[ONION] ACK -> %08X\n", origSender);
+                    }
+                }
             }
         }
     }
 
     switch (type) {
         case MSG_HEARTBEAT:
-            Serial.printf("[ONION] HB da %08X\n", origSender);
+            Serial.printf("[ONION] HB from %08X\n", origSender);
             break;
         case MSG_SOS_MEDIC:
-            Serial.printf("[ONION] !!! SOS MEDICO da %08X !!!\n", origSender);
+            Serial.printf("[ONION] !!! SOS from %08X !!!\n", origSender);
             updateUI("SOS", "SOS (onion)");
             break;
         case MSG_CHAT: {
             char buf[MAX_MESSAGE_BYTES + 1];
             uint16_t n = len > MAX_MESSAGE_BYTES ? MAX_MESSAGE_BYTES : len;
             memcpy(buf, data, n); buf[n] = '\0';
-            Serial.printf("[ONION] Chat da %08X: %s\n", origSender, buf);
+            Serial.printf("[ONION] Chat %08X: %s\n", origSender, buf);
             updateUI("CHAT", buf);
             break;
         }
         default:
-            Serial.printf("[ONION] tipo 0x%02X len=%u da %08X\n", type, len, origSender);
+            Serial.printf("[ONION] type 0x%02X len=%u from %08X\n", type, len, origSender);
             break;
     }
 }
 
-// ============================================================================
-// 21. FINAL DISPATCH
-// ============================================================================
-static void handleKeyExchange(uint8_t type, const uint8_t* data, uint16_t len,
-                              uint32_t remoteID) {
-    if (type == MSG_KYBER_PUBKEY) {
-        if (len != KYBER_PK_SIZE) return;
-        static uint8_t ct[KYBER_CT_SIZE];
-        uint8_t shared[32];
-        pqc_kyber512_encapsulate(ct, shared, data);
-        PeerSession* ps = peerGetOrCreate(remoteID);
-        memcpy(ps->shared_secret, shared, 32);
-        ps->established = true; ps->tx_seq = 1; ps->last_rx_seq = 0;
-        ps->last_activity = nowMs();
-        outgoingStart(MSG_KYBER_CIPHERTEXT, remoteID, ct, KYBER_CT_SIZE, FLAG_RELAY_OK);
-        Serial.printf("[KYBER] session %08X ready\n", remoteID);
-        updateUI("SECURE", "Handshake OK");
-    } else if (type == MSG_KYBER_CIPHERTEXT) {
-        if (len != KYBER_CT_SIZE) return;
-        if (!g_kyber_ready) return;
-        uint8_t shared[32];
-        pqc_kyber512_decapsulate(shared, data, g_kyber_sk);
-        PeerSession* ps = peerGetOrCreate(remoteID);
-        memcpy(ps->shared_secret, shared, 32);
-        ps->established = true; ps->tx_seq = 1; ps->last_rx_seq = 0;
-        ps->last_activity = nowMs();
-        Serial.printf("[KYBER] session %08X ready\n", remoteID);
-        updateUI("SECURE", "Handshake OK");
+static void handleOnionAckPacket(GPacket& frame, uint8_t* data, uint16_t len) {
+    if (!g_x25519_ready) return;
+    if (len < X25519_KEY_SIZE + 28) return;
+    const uint8_t* eph_pub = data;
+    const uint8_t* ct = data + X25519_KEY_SIZE;
+    uint16_t ctLen = len - X25519_KEY_SIZE;
+
+    uint8_t K[32];
+    if (!x25519Shared(g_x25519_sk, eph_pub, K)) return;
+    uint8_t aad[X25519_KEY_SIZE];
+    memcpy(aad, eph_pub, X25519_KEY_SIZE);
+
+    uint8_t token[4]; uint16_t outLen = 0;
+    if (!x25519Decrypt(K, aad, X25519_KEY_SIZE, ct, ctLen, token, outLen)) return;
+    if (outLen < 4) return;
+    uint32_t tok = ((uint32_t)token[0] << 24) | ((uint32_t)token[1] << 16)
+                 | ((uint32_t)token[2] <<  8) |  (uint32_t)token[3];
+    if (onionTrackerConsume(tok)) {
+        Serial.printf("[ONION] *** ACK E2E da %08X ***\n", frame.senderID);
+        updateUI("ONION ACK", "delivered");
     }
 }
 
+// ============================================================================
+// 21. KEY EXCHANGE + HEARTBEAT X25519
+// ============================================================================
+static void handleHeartbeatPayload(const uint8_t* data, uint16_t len, uint32_t sender) {
+    if (len < X25519_KEY_SIZE) return;
+    PeerSession* ps = peerFind(sender);
+    if (!ps || ps->state == PEER_NONE) return;
+    memcpy(ps->x25519_pk, data, X25519_KEY_SIZE);
+    ps->has_x25519_pk = true;
+}
+
+static void handleKeyExchangePubKey(const uint8_t* data, uint16_t len, uint32_t remoteID) {
+    if (len != KYBER_PK_SIZE) return;
+    if (isBlocked(remoteID)) return;
+    PeerSession* ps = peerFind(remoteID);
+    if (ps && ps->state == PEER_ESTABLISHED) return;
+
+    unsigned long t = nowMs();
+    if (ps && (t - ps->last_request_time < REQUEST_MIN_INTERVAL)) return;
+
+    if (!ps) {
+        ps = peerGetOrCreate(remoteID);
+        if (!ps) return;
+    }
+    ps->last_request_time = t;
+    ps->last_activity = t;
+
+    PendingPeer* pp = pendingFind(remoteID);
+    if (!pp) pp = pendingAlloc();
+    if (!pp) return;
+    pp->active = true;
+    pp->peerID = remoteID;
+    memcpy(pp->pk, data, KYBER_PK_SIZE);
+    pp->since = t;
+
+    bool accept = false;
+    switch (g_policy) {
+        case POLICY_AUTO:      accept = true; break;
+        case POLICY_WHITELIST: accept = isWhitelisted(remoteID); break;
+        case POLICY_HYBRID:    accept = (countEstablished() < HYBRID_AUTO_LIMIT); break;
+        case POLICY_MANUAL:    accept = false; break;
+    }
+    ps->state = PEER_PENDING_IN;
+
+    if (accept) {
+        // encapsula + rispondi
+        static uint8_t ct[KYBER_CT_SIZE];
+        uint8_t shared[32];
+        pqc_kyber512_encapsulate(ct, shared, pp->pk);
+        memcpy(ps->shared_secret, shared, 32);
+        ps->state = PEER_ESTABLISHED;
+        ps->tx_seq = 1;
+        ps->last_rx_seq = 0;
+        pendingFree(remoteID);
+        outgoingStart(MSG_KYBER_CIPHERTEXT, remoteID, ct, KYBER_CT_SIZE, FLAG_RELAY_OK, true);
+        Serial.printf("[KYBER] auto-accept %08X\n", remoteID);
+        updateUI("SECURE", "auto");
+    } else {
+        Serial.printf("[KYBER] PENDING %08X\n", remoteID);
+        updateUI("PENDING", "richiesta peer");
+    }
+}
+
+static void handleKeyExchangeCiphertext(const uint8_t* data, uint16_t len, uint32_t remoteID) {
+    if (len != KYBER_CT_SIZE) return;
+    if (!g_kyber_ready) return;
+    if (isBlocked(remoteID)) return;
+    PeerSession* ps = peerFind(remoteID);
+    if (!ps || ps->state != PEER_PENDING_OUT) return;
+    uint8_t shared[32];
+    pqc_kyber512_decapsulate(shared, data, g_kyber_sk);
+    memcpy(ps->shared_secret, shared, 32);
+    ps->state = PEER_ESTABLISHED;
+    ps->tx_seq = 1;
+    ps->last_rx_seq = 0;
+    ps->last_activity = nowMs();
+    Serial.printf("[KYBER] ESTABLISHED with %08X\n", remoteID);
+    updateUI("SECURE", "sessione attiva");
+}
+
+static bool initiateHandshake(uint32_t target) {
+    if (target == BROADCAST_ID || target == myID) return false;
+    if (isBlocked(target)) return false;
+
+    PeerSession* ps = peerFind(target);
+    if (ps && (ps->state == PEER_ESTABLISHED || ps->state == PEER_PENDING_OUT)) return false;
+    if (!ps) {
+        ps = peerGetOrCreate(target);
+        if (!ps) return false;
+    } else {
+        pendingFree(target);
+    }
+    ps->state = PEER_PENDING_OUT;
+    ps->last_activity = nowMs();
+    ps->last_request_time = nowMs();
+
+    kyberEnsureKeypair();
+    Serial.printf("[KYBER] init -> %08X\n", target);
+    outgoingStart(MSG_KYBER_PUBKEY, target, g_kyber_pk, KYBER_PK_SIZE, FLAG_RELAY_OK, true);
+    updateUI("HANDSHAKE", "attesa CT");
+    return true;
+}
+
+static bool peerAcceptPending(uint32_t peerID) {
+    PendingPeer* pp = pendingFind(peerID);
+    PeerSession* ps = peerFind(peerID);
+    if (!pp || !ps || ps->state != PEER_PENDING_IN) return false;
+
+    static uint8_t ct[KYBER_CT_SIZE];
+    uint8_t shared[32];
+    pqc_kyber512_encapsulate(ct, shared, pp->pk);
+    memcpy(ps->shared_secret, shared, 32);
+    ps->state = PEER_ESTABLISHED;
+    ps->tx_seq = 1;
+    ps->last_rx_seq = 0;
+    ps->last_activity = nowMs();
+    pendingFree(peerID);
+    outgoingStart(MSG_KYBER_CIPHERTEXT, peerID, ct, KYBER_CT_SIZE, FLAG_RELAY_OK, true);
+    Serial.printf("[KYBER] ACCEPT %08X\n", peerID);
+    updateUI("ACCEPT", "peer OK");
+    return true;
+}
+
+static bool peerRejectPending(uint32_t peerID) {
+    pendingFree(peerID);
+    PeerSession* ps = peerFind(peerID);
+    if (ps && ps->state == PEER_PENDING_IN) memset(ps, 0, sizeof(PeerSession));
+
+    GPacket p;
+    buildHeader(p, MSG_KYBER_REJECT, peerID, 1, 0, 0,
+                FLAG_RELAY_OK, ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+    transmitFrame(p);
+    Serial.printf("[KYBER] REJECT %08X\n", peerID);
+    return true;
+}
+
+// ============================================================================
+// 22. FINAL DISPATCH
+// ============================================================================
 static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
     uint8_t  type   = frame.msgType;
     uint32_t sender = frame.senderID;
 
-    if (type == MSG_ONION) {
-        handleOnionLayer(sender, data, len);
-        return;
-    }
-    if (type == MSG_KYBER_PUBKEY || type == MSG_KYBER_CIPHERTEXT) {
-        handleKeyExchange(type, data, len, sender);
+    if (isBlocked(sender)) return;
+
+    if (type == MSG_ONION) { handleOnionLayer(sender, data, len); return; }
+    if (type == MSG_ONION_ACK) { handleOnionAckPacket(frame, data, len); return; }
+    if (type == MSG_KYBER_PUBKEY) { handleKeyExchangePubKey(data, len, sender); return; }
+    if (type == MSG_KYBER_CIPHERTEXT) { handleKeyExchangeCiphertext(data, len, sender); return; }
+    if (type == MSG_KYBER_REJECT) {
+        PeerSession* ps = peerFind(sender);
+        if (ps && ps->state == PEER_PENDING_OUT) memset(ps, 0, sizeof(PeerSession));
+        updateUI("REJECT", "peer rifiutato");
         return;
     }
     if (type == MSG_ACK) {
@@ -1224,11 +1806,16 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
         outgoingHandleAck(sender, sess, mask);
         return;
     }
-    if (type == MSG_NACK) { Serial.printf("[RX] NACK %08X\n", sender); return; }
+    if (type == MSG_NACK) return;
+
+    // Heartbeat: payload può contenere x25519_pk (32 byte)
+    if (type == MSG_HEARTBEAT) {
+        if (len >= X25519_KEY_SIZE) handleHeartbeatPayload(data, len, sender);
+        return;
+    }
 
     if (!(frame.flags & FLAG_ENCRYPTED) && (frame.flags & FLAG_PLAINTEXT_WARN)
         && frame.targetID != BROADCAST_ID) {
-        Serial.printf("[RX] *** PLAINTEXT da %08X ***\n", sender);
         updateUI("PLAINTEXT!", "msg in chiaro");
     }
 
@@ -1238,74 +1825,46 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
 
     if (frame.flags & FLAG_ENCRYPTED) {
         PeerSession* ps = peerFind(sender);
-        if (!ps || !ps->established) return;
+        if (!ps || ps->state != PEER_ESTABLISHED) return;
         uint16_t outLen = 0;
-        if (!decryptGCM_AAD(ps->shared_secret, frame, data, len, tmp, outLen)) {
-            Serial.println("[RX] GCM auth fail");
-            return;
-        }
-        if (frame.seq <= ps->last_rx_seq) {
-            Serial.println("[RX] replay respinto");
-            return;
-        }
+        if (!decryptGCM_AAD(ps->shared_secret, frame, data, len, tmp, outLen)) return;
+        if (frame.seq <= ps->last_rx_seq) return;
         ps->last_rx_seq = frame.seq;
         ps->last_activity = nowMs();
-        plain = tmp;
-        plainLen = outLen;
+        plain = tmp; plainLen = outLen;
     }
 
     switch (type) {
-        case MSG_HEARTBEAT:
-            Serial.printf("[RX] HB via %s\n", protoName(g_lastRxProto));
-            break;
         case MSG_SOS_MEDIC:
-            Serial.println("[RX] !!! SOS MEDICO !!!");
             updateUI("SOS", "SOS MEDICO");
             break;
         case MSG_CHAT: {
             char buf[MAX_MESSAGE_BYTES + 1];
             uint16_t n = plainLen > MAX_MESSAGE_BYTES ? MAX_MESSAGE_BYTES : plainLen;
             memcpy(buf, plain, n); buf[n] = '\0';
-            Serial.printf("[RX] Chat %08X via %s: %s\n",
-                          sender, protoName(g_lastRxProto), buf);
+            Serial.printf("[RX] Chat %08X: %s\n", sender, buf);
             updateUI("CHAT", buf);
             break;
         }
-        case MSG_ONION_ACK: {
-            if (plainLen < ONION_TOKEN_LEN) break;
-            uint32_t tok = ((uint32_t)plain[0] << 24) | ((uint32_t)plain[1] << 16)
-                         | ((uint32_t)plain[2] <<  8) |  (uint32_t)plain[3];
-            if (onionTrackerConsume(tok)) {
-                Serial.printf("[ONION] *** ACK E2E da %08X ***\n", sender);
-                updateUI("ONION ACK", "delivered");
-            }
-            break;
-        }
-        default:
-            Serial.printf("[RX] type 0x%02X len=%u via %s\n",
-                          type, plainLen, protoName(g_lastRxProto));
-            break;
     }
 }
 
 // ============================================================================
-// 22. RICEZIONE (entry point multi-proto)
+// 23. RICEZIONE
 // ============================================================================
 static void handleReceivedPacketFromProto(GPacket& p, ProtoType src) {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
-
     g_lastRxProto = (uint8_t)src;
 
-    // Aggiorna lastSeenProto SOLO se il pacchetto è diretto (originProto == src)
-    // perché se è relayato, originProto riflette il proto dell'originatore, non del last-hop.
+    if (p.targetID != BROADCAST_ID && p.senderID != myID && isBlocked(p.senderID)) return;
+
+    // Aggiorna lastSeenProto SOLO se pacchetto diretto
     if (p.senderID != myID && (ProtoType)p.originProto == src) {
         PeerSession* ps = peerFind(p.senderID);
-        if (ps && ps->inUse) ps->lastSeenProto = (uint8_t)src;
+        if (ps && ps->state != PEER_NONE) ps->lastSeenProto = (uint8_t)src;
     }
 
-    if (dedupCheckAndInsert(p.senderID, p.sessionID, p.frameIdx)) {
-        xSemaphoreGiveRecursive(stateMutex); return;
-    }
+    if (dedupCheckAndInsert(p.senderID, p.sessionID, p.frameIdx)) return;
+
     bool isForMe     = (p.targetID == myID);
     bool isBroadcast = (p.targetID == BROADCAST_ID);
     bool forMe       = isForMe || isBroadcast;
@@ -1313,47 +1872,56 @@ static void handleReceivedPacketFromProto(GPacket& p, ProtoType src) {
 
     if (!forMe) foreign_packets_count++;
 
-    // Relay (non onion). MSG_ONION è gestito dal layer logico.
+    // Relay: pacchetti normali (non onion, non ACK, non handshake)
+    // Il bridging cross-proto è permesso: se il target non è raggiungibile
+    // via src, scegliamo un proto diverso con selectProtoFor.
     if (relayable && p.targetID != myID && p.msgType != MSG_ONION) {
         GPacket r = p;
         r.ttl--;
-        // Relay via stesso proto d'ingresso
-        r.originProto = (uint8_t)src;
-        sendVia(src, r);
+        // Verifica che il target sia raggiungibile via proto src,
+        // altrimenti bridging verso un proto alternativo
+        ProtoType outProto = src;
+        if (p.targetID != BROADCAST_ID) {
+            ProtoType preferred = selectProtoFor(p.targetID);
+            if (preferred != src && protoReady(preferred)) {
+                outProto = preferred;
+                Serial.printf("[RELAY] bridge %s -> %s for %08X\n",
+                              protoName(src), protoName(outProto), p.targetID);
+            }
+        }
+        r.originProto = (uint8_t)outProto;
+        sendVia(outProto, r);
     }
     if (forMe) {
         updateUI("RX", protoName(src), 0, 0);
         handlePacketReassembly(p);
     }
     lastActivity = nowMs();
-    xSemaphoreGiveRecursive(stateMutex);
 }
 
 // ============================================================================
-// 23. SEND SECURE OR PLAIN
+// 24. SEND SECURE OR PLAIN
 // ============================================================================
 static void sendSecureOrPlain(GMessageType type, uint32_t target,
                               const uint8_t* data, uint16_t len) {
     PeerSession* ps = peerFind(target);
-    bool doEnc = (ps && ps->established && target != BROADCAST_ID);
+    bool doEnc = (ps && ps->state == PEER_ESTABLISHED && target != BROADCAST_ID);
 
     if (doEnc && len + ENC_OVERHEAD <= FRAME_PAYLOAD) {
         uint8_t flags = FLAG_RELAY_OK | FLAG_ENCRYPTED;
         if (target != BROADCAST_ID) flags |= FLAG_ACK_REQ;
         uint16_t sessionID = ++g_sessionCounter;
         uint32_t seq = ps->tx_seq++;
-        GPacket p = buildHeader(type, target, 1, 0, len + ENC_OVERHEAD, flags,
-                                sessionID, seq, DEFAULT_TTL);
-        uint8_t blob[FRAME_PAYLOAD];
-        uint16_t blobLen = 0;
+        GPacket p;
+        buildHeader(p, type, target, 1, 0, len + ENC_OVERHEAD, flags,
+                    sessionID, seq, DEFAULT_TTL);
+        uint8_t blob[FRAME_PAYLOAD]; uint16_t blobLen = 0;
         if (encryptGCM_AAD(ps->shared_secret, p, data, len, blob, blobLen)) {
-            memcpy(p.payload, blob, blobLen);
-            p.payloadLen = blobLen;
+            memcpy(p.payload, blob, blobLen); p.payloadLen = blobLen;
             transmitFrame(p);
             return;
         }
     }
-
     uint8_t flags = FLAG_RELAY_OK;
     if (target == BROADCAST_ID) {
         flags |= FLAG_BROADCAST;
@@ -1366,43 +1934,37 @@ static void sendSecureOrPlain(GMessageType type, uint32_t target,
 }
 
 // ============================================================================
-// 24. HEARTBEAT (broadcast su tutti i protocolli)
+// 25. HEARTBEAT (include x25519_pk)
 // ============================================================================
 static unsigned long lastHeartbeat = 0;
 static void heartbeatTick() {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
-    if (nowMs() - lastHeartbeat < 60000) {
-        xSemaphoreGiveRecursive(stateMutex); return;
-    }
+    if (nowMs() - lastHeartbeat < 60000) return;
     lastHeartbeat = nowMs();
+    x25519EnsureKeypair();
 
-    // Heartbeat su LoRa (mesh backbone)
-    outgoingStart(MSG_HEARTBEAT, BROADCAST_ID, nullptr, 0, FLAG_RELAY_OK);
+    // Heartbeat con payload x25519_pk (32 byte) su LoRa broadcast
+    outgoingStart(MSG_HEARTBEAT, BROADCAST_ID, g_x25519_pk, X25519_KEY_SIZE, FLAG_RELAY_OK);
 
-    // Inoltre heartbeat diretto via WiFi e BT se disponibili
-    GPacket hb = buildHeader(MSG_HEARTBEAT, BROADCAST_ID, 1, 0, 0,
-                             FLAG_RELAY_OK | FLAG_BROADCAST,
-                             ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+    // Duplicato via WiFi/BT per far apprendere la pk a peer su altri mezzi
+    GPacket hb;
+    buildHeader(hb, MSG_HEARTBEAT, BROADCAST_ID, 1, 0, X25519_KEY_SIZE,
+                FLAG_RELAY_OK | FLAG_BROADCAST,
+                ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+    memcpy(hb.payload, g_x25519_pk, X25519_KEY_SIZE);
     if (g_wifiReady) { hb.originProto = PROTO_WIFI; wifiSend(hb); }
-    if (g_btReady && g_bleConnected) { hb.originProto = PROTO_BT; bleSend(hb); }
-
-    xSemaphoreGiveRecursive(stateMutex);
+    if (protoReady(PROTO_BT)) { hb.originProto = PROTO_BT; bleSend(hb); }
 }
 
 // ============================================================================
-// 25. WEB UI
+// 26. WEB UI
 // ============================================================================
 static bool webAuth(AsyncWebServerRequest* r) {
-    if (!r->authenticate(WEB_USER, WEB_PASS)) {
-        r->requestAuthentication();
-        return false;
-    }
+    if (!r->authenticate(WEB_USER, WEB_PASS)) { r->requestAuthentication(); return false; }
     return true;
 }
 
 static uint8_t parseHops(const String& s, uint32_t* out, uint8_t maxN) {
-    uint8_t n = 0;
-    int start = 0;
+    uint8_t n = 0; int start = 0;
     while (start < (int)s.length() && n < maxN) {
         int comma = s.indexOf(',', start);
         String tok = (comma < 0) ? s.substring(start) : s.substring(start, comma);
@@ -1418,156 +1980,248 @@ static uint8_t parseHops(const String& s, uint32_t* out, uint8_t maxN) {
     return n;
 }
 
-static void setupWeb() {
-    char apName[24];
-    sprintf(apName, "%s%08X", WIFI_SSID_PREFIX, myID);
-    WiFi.softAP(apName, WIFI_PASSWORD);
-    Serial.printf("[WiFi] AP %s -> %s\n", apName, WiFi.softAPIP().toString().c_str());
+static String pageMain() {
+    String h;
+    h += "<!DOCTYPE HTML><html><head><meta charset='utf-8'>";
+    h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    h += "<title>Qorlyn</title><style>";
+    h += "body{font-family:sans-serif;background:#181818;color:#eee;text-align:center;padding:12px;margin:0}";
+    h += "button{padding:10px 14px;margin:4px;border:none;border-radius:6px;font-size:14px;cursor:pointer}";
+    h += ".sos{background:#d32f2f;color:#fff}.msg{background:#388e3c;color:#fff}";
+    h += ".key{background:#fbc02d;color:#000}.onion{background:#5e35b1;color:#fff}";
+    h += ".ok{background:#2e7d32;color:#fff}.warn{background:#ef6c00;color:#fff}.danger{background:#c62828;color:#fff}";
+    h += "input[type=text]{padding:10px;width:85%;margin:6px;border-radius:6px;border:none;max-width:520px}";
+    h += ".hint{font-size:12px;color:#888;margin-top:4px}";
+    h += ".card{background:#222;border-radius:8px;padding:12px;margin:12px auto;max-width:640px;text-align:left}";
+    h += ".row{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding:8px 0;gap:8px;flex-wrap:wrap}";
+    h += ".mono{font-family:ui-monospace,monospace;font-size:13px}";
+    h += "</style></head><body>";
 
+    char idbuf[16]; sprintf(idbuf, "%08X", myID);
+    h += "<h2>Qorlyn</h2><div class='mono'>ID: "; h += idbuf; h += "</div>";
+    h += "<div class='hint'>LoRa:"; h += g_loraReady ? "ON" : "off";
+    h += " | WiFi:"; h += g_wifiReady ? (WiFi.status()==WL_CONNECTED ? "STA+AP" : "AP") : "off";
+    h += " | BLE:";  h += (g_btReady && g_bleCentralConnected) ? "conn" : (g_btReady ? "adv" : "off");
+    h += " | Policy: "; h += policyName(g_policy); h += "</div>";
+
+    // Pending
+    h += "<div class='card'><h3>PENDING</h3>";
+    bool any = false;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers[i].state == PEER_PENDING_IN) {
+            any = true;
+            char b[16]; sprintf(b, "%08X", peers[i].peerID);
+            h += "<div class='row'><span class='mono'>"; h += b; h += " pending-in</span><span>";
+            h += "<button class='ok' onclick=\"a('/approve?id="; h += b; h += "')\">accetta</button>";
+            h += "<button class='warn' onclick=\"a('/reject?id="; h += b; h += "')\">rifiuta</button>";
+            h += "<button class='danger' onclick=\"a('/block?id="; h += b; h += "')\">blocca</button>";
+            h += "</span></div>";
+        }
+        if (peers[i].state == PEER_PENDING_OUT) {
+            any = true;
+            char b[16]; sprintf(b, "%08X", peers[i].peerID);
+            h += "<div class='row'><span class='mono'>"; h += b; h += " pending-out</span>";
+            h += "<span><button class='warn' onclick=\"a('/forget?id="; h += b; h += "')\">annulla</button></span></div>";
+        }
+    }
+    if (!any) h += "<div class='hint'>nessuna</div>";
+    h += "</div>";
+
+    // Established
+    h += "<div class='card'><h3>ESTABLISHED</h3>";
+    any = false;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers[i].state != PEER_ESTABLISHED) continue;
+        any = true;
+        char b[16]; sprintf(b, "%08X", peers[i].peerID);
+        h += "<div class='row'><span class='mono'>"; h += b;
+        h += " ("; h += protoName(peers[i].lastSeenProto); h += ")";
+        h += peers[i].has_x25519_pk ? " x25519:ok" : " x25519:no";
+        h += "</span><span>";
+        h += "<button class='warn' onclick=\"a('/forget?id="; h += b; h += "')\">dimentica</button>";
+        h += "<button class='danger' onclick=\"a('/block?id="; h += b; h += "')\">blocca</button>";
+        h += "</span></div>";
+    }
+    if (!any) h += "<div class='hint'>nessuna</div>";
+    h += "</div>";
+
+    // Blocked
+    h += "<div class='card'><h3>BLOCKED</h3>";
+    for (uint8_t i = 0; i < g_blocklist_count; i++) {
+        char b[16]; sprintf(b, "%08X", g_blocklist[i]);
+        h += "<div class='row'><span class='mono'>"; h += b;
+        h += "</span><button class='ok' onclick=\"a('/unblock?id="; h += b; h += "')\">sblocca</button></div>";
+    }
+    if (!g_blocklist_count) h += "<div class='hint'>nessuno</div>";
+    h += "</div>";
+
+    // Policy
+    h += "<div class='card'><h3>POLICY</h3>";
+    const char* pols[] = {"auto","manual","whitelist","hybrid"};
+    for (int i = 0; i < 4; i++) {
+        h += "<button class='key' onclick=\"a('/policy?p="; h += String(i); h += "')\">";
+        h += pols[i]; if (g_policy == (uint8_t)i) h += " *";
+        h += "</button>";
+    }
+    h += "</div>";
+
+    // Whitelist
+    h += "<div class='card'><h3>WHITELIST</h3>";
+    for (uint8_t i = 0; i < g_whitelist_count; i++) {
+        char b[16]; sprintf(b, "%08X", g_whitelist[i]);
+        h += "<div class='row'><span class='mono'>"; h += b;
+        h += "</span><button class='danger' onclick=\"a('/wl_del?id="; h += b; h += "')\">rimuovi</button></div>";
+    }
+    h += "<div class='row'><input type='text' id='wlid' placeholder='ID hex' style='width:auto;flex:1'>";
+    h += "<button class='msg' onclick=\"wl()\">aggiungi</button></div></div>";
+
+    // Send
+    h += "<div class='card'><h3>INVIA</h3>";
+    h += "<input type='text' id='t' placeholder='Target ID' value='FFFFFFFF'>";
+    h += "<input type='text' id='hops' placeholder='Onion hops (hex comma sep.)' value=''>";
+    h += "<input type='text' id='m' placeholder='Messaggio'>";
+    h += "<label><input type='checkbox' id='ack' checked> ACK end-to-end</label>";
+    h += "<br><button class='key' onclick=\"s('KEY')\">HANDSHAKE</button>";
+    h += "<button class='msg' onclick=\"s('CHAT')\">CHAT</button>";
+    h += "<button class='sos' onclick=\"s('SOS')\">SOS</button>";
+    h += "<button class='onion' onclick=\"s('ONION')\">ONION</button>";
+    h += "</div>";
+
+    h += "<script>";
+    h += "function a(u){fetch(u).then(r=>r.ok?location.reload():r.text().then(t=>alert(t)));}";
+    h += "function wl(){var v=document.getElementById('wlid').value;if(v)a('/wl_add?id='+v);}";
+    h += "function s(t){";
+    h += "var tg=document.getElementById('t').value,hp=document.getElementById('hops').value,";
+    h += "msg=document.getElementById('m').value,ack=document.getElementById('ack').checked?'1':'0';";
+    h += "send(0);function send(f){fetch('/send',{method:'POST',";
+    h += "headers:{'Content-Type':'application/x-www-form-urlencoded'},";
+    h += "body:'type='+t+'&target='+tg+'&hops='+hp+'&ack='+ack+'&msg='+encodeURIComponent(msg)+'&force='+f";
+    h += "}).then(r=>{if(r.status===409){if(confirm('Target senza sessione. In chiaro?'))send(1);}";
+    h += "else if(!r.ok)r.text().then(x=>alert(x));});}}";
+    h += "</script></body></html>";
+    return h;
+}
+
+static void setupWeb() {
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
         if (!webAuth(req)) return;
         lastActivity = nowMs();
-        String h;
-        h += "<!DOCTYPE HTML><html><head><meta charset='utf-8'>";
-        h += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-        h += "<title>Qorlyn</title><style>";
-        h += "body{font-family:sans-serif;background:#181818;color:#eee;text-align:center;padding:12px}";
-        h += "button{padding:14px 20px;margin:6px;border:none;border-radius:6px;font-size:16px;cursor:pointer}";
-        h += ".sos{background:#d32f2f;color:#fff}.msg{background:#388e3c;color:#fff}";
-        h += ".key{background:#fbc02d;color:#000}.onion{background:#5e35b1;color:#fff}";
-        h += "input[type=text]{padding:10px;width:85%;margin:6px;border-radius:6px;border:none}";
-        h += ".hint{font-size:12px;color:#888;margin-top:4px}";
-        h += ".proto{font-size:12px;color:#aaa;margin-top:6px}";
-        h += "</style></head><body>";
-        char idbuf[16]; sprintf(idbuf, "%08X", myID);
-        h += "<h2>Qorlyn</h2><div>ID: "; h += idbuf; h += "</div>";
-        h += "<div class='proto'>LoRa: ";
-        h += g_loraReady ? "ON" : "off";
-        h += " | WiFi: "; h += g_wifiReady ? "ON" : "off";
-        h += " | BT: ";   h += (g_btReady && g_bleConnected) ? "ON" : (g_btReady ? "adv" : "off");
-        h += "</div>";
-        h += "<input type='text' id='t' placeholder='Target ID (hex)' value='FFFFFFFF'>";
-        h += "<input type='text' id='hops' placeholder='Onion hops (hex, comma sep.)' value=''>";
-        h += "<div class='hint'>es. <code>DEADBEEF,12345678</code> = 2 hop intermedi (max 5)</div>";
-        h += "<input type='text' id='m' placeholder='Messaggio'>";
-        h += "<label><input type='checkbox' id='ack' checked> ACK end-to-end</label>";
-        h += "<br><button class='msg' onclick=\"s('CHAT')\">CHAT</button>";
-        h += "<button class='sos' onclick=\"s('SOS')\">SOS MEDICO</button>";
-        h += "<button class='key' onclick=\"s('KEY')\">HANDSHAKE KYBER</button>";
-        h += "<button class='onion' onclick=\"s('ONION')\">ONION</button>";
-        h += "<script>";
-        h += "function s(t){";
-        h += "var tg=document.getElementById('t').value;";
-        h += "var hp=document.getElementById('hops').value;";
-        h += "var msg=document.getElementById('m').value;";
-        h += "var ack=document.getElementById('ack').checked?'1':'0';";
-        h += "send(false);";
-        h += "function send(force){";
-        h += "fetch('/send',{method:'POST',";
-        h += "headers:{'Content-Type':'application/x-www-form-urlencoded'},";
-        h += "body:'type='+encodeURIComponent(t)+";
-        h += "'&target='+encodeURIComponent(tg)+";
-        h += "'&hops='+encodeURIComponent(hp)+";
-        h += "'&ack='+ack+";
-        h += "'&msg='+encodeURIComponent(msg)+";
-        h += "'&force='+(force?1:0)}).then(function(r){";
-        h += "if(r.status===409){";
-        h += "if(confirm('Il destinatario non ha una sessione sicura.\\nInviare comunque IN CHIARO?')) send(true);";
-        h += "}else if(r.status!==200){ r.text().then(function(x){alert('Errore: '+x);}); }";
-        h += "});}";
-        h += "}";
-        h += "</script>";
-        h += "</body></html>";
-        req->send(200, "text/html", h);
+        req->send(200, "text/html", pageMain());
     });
-
+    server.on("/approve", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("id")) { req->send(400,"text/plain","no id"); return; }
+        uint32_t id = strtoul(req->getParam("id")->value().c_str(), nullptr, 16);
+        bool ok = peerAcceptPending(id);
+        req->send(ok?200:400, "text/plain", ok?"ok":"no");
+    });
+    server.on("/reject", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("id")) { req->send(400,"text/plain","no id"); return; }
+        uint32_t id = strtoul(req->getParam("id")->value().c_str(), nullptr, 16);
+        bool ok = peerRejectPending(id);
+        req->send(ok?200:400, "text/plain", ok?"ok":"no");
+    });
+    server.on("/forget", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("id")) { req->send(400,"text/plain","no id"); return; }
+        peerForget(strtoul(req->getParam("id")->value().c_str(), nullptr, 16));
+        req->send(200, "text/plain", "ok");
+    });
+    server.on("/block", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("id")) { req->send(400,"text/plain","no id"); return; }
+        uint32_t id = strtoul(req->getParam("id")->value().c_str(), nullptr, 16);
+        peerForget(id); addBlocklist(id); removeWhitelist(id);
+        req->send(200, "text/plain", "ok");
+    });
+    server.on("/unblock", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("id")) { req->send(400,"text/plain","no id"); return; }
+        removeBlocklist(strtoul(req->getParam("id")->value().c_str(), nullptr, 16));
+        req->send(200, "text/plain", "ok");
+    });
+    server.on("/policy", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("p")) { req->send(400,"text/plain","no p"); return; }
+        int v = atoi(req->getParam("p")->value().c_str());
+        if (v < 0 || v > 3) { req->send(400,"text/plain","bad"); return; }
+        g_policy = (uint8_t)v;
+        req->send(200, "text/plain", "ok");
+    });
+    server.on("/wl_add", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("id")) { req->send(400,"text/plain","no id"); return; }
+        uint32_t id = strtoul(req->getParam("id")->value().c_str(), nullptr, 16);
+        if (isBlocked(id)) { req->send(400,"text/plain","blocked"); return; }
+        addWhitelist(id);
+        req->send(200, "text/plain", "ok");
+    });
+    server.on("/wl_del", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!webAuth(req)) return;
+        if (!req->hasParam("id")) { req->send(400,"text/plain","no id"); return; }
+        removeWhitelist(strtoul(req->getParam("id")->value().c_str(), nullptr, 16));
+        req->send(200, "text/plain", "ok");
+    });
     server.on("/send", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (!webAuth(req)) return;
         lastActivity = nowMs();
         if (!req->hasParam("type", true) || !req->hasParam("target", true)) {
-            req->send(400, "text/plain", "parametri mancanti"); return;
+            req->send(400,"text/plain","param"); return;
         }
-        String type    = req->getParam("type", true)->value();
-        String tstr    = req->getParam("target", true)->value();
+        String type = req->getParam("type", true)->value();
+        String tstr = req->getParam("target", true)->value();
         String hopsStr = req->hasParam("hops", true) ? req->getParam("hops", true)->value() : "";
-        String msg     = req->hasParam("msg", true) ? req->getParam("msg", true)->value() : "";
-        bool ackReq    = req->hasParam("ack", true) && req->getParam("ack", true)->value() == "1";
-        bool force     = req->hasParam("force", true) && req->getParam("force", true)->value() == "1";
+        String msg  = req->hasParam("msg", true) ? req->getParam("msg", true)->value() : "";
+        bool ackReq = req->hasParam("ack", true) && req->getParam("ack", true)->value() == "1";
+        bool force  = req->hasParam("force", true) && req->getParam("force", true)->value() == "1";
 
         char* endp = nullptr;
         uint32_t target = strtoul(tstr.c_str(), &endp, 16);
         if (!endp || *endp != '\0' || tstr.length() == 0) {
-            req->send(400, "text/plain", "target non valido"); return;
+            req->send(400,"text/plain","target"); return;
         }
+        if (isBlocked(target)) { req->send(400,"text/plain","blocked"); return; }
 
-        if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) {
-            req->send(500, "text/plain", "mutex error"); return;
+        if (type == "KEY") {
+            bool ok = initiateHandshake(target);
+            req->send(ok?200:400, "text/plain", ok?"ok":"fail");
+            return;
         }
-
         if (type == "ONION") {
             uint32_t hops[ONION_MAX_HOPS - 1];
             uint8_t nHops = parseHops(hopsStr, hops, ONION_MAX_HOPS - 1);
-            if (msg.length() > MAX_MESSAGE_BYTES) {
-                xSemaphoreGiveRecursive(stateMutex);
-                req->send(413, "text/plain", "msg troppo lungo"); return;
-            }
+            if (msg.length() > MAX_MESSAGE_BYTES) { req->send(413,"text/plain","msg long"); return; }
             bool ok = onionSend(MSG_CHAT, target,
                                 (const uint8_t*)msg.c_str(), msg.length(),
                                 hops, nHops, ackReq);
-            xSemaphoreGiveRecursive(stateMutex);
-            if (!ok) { req->send(400, "text/plain", "onion send failed"); return; }
-            req->send(200, "text/plain", "ok");
+            req->send(ok?200:400, "text/plain", ok?"ok":"onion fail");
             return;
         }
-
         if ((type == "SOS" || type == "CHAT") && target != BROADCAST_ID) {
             PeerSession* ps = peerFind(target);
-            bool willEncrypt = (ps && ps->established);
-            if (type == "CHAT" && msg.length() + ENC_OVERHEAD > FRAME_PAYLOAD) {
-                willEncrypt = false;
-            }
+            bool willEncrypt = (ps && ps->state == PEER_ESTABLISHED);
+            if (type == "CHAT" && msg.length() + ENC_OVERHEAD > FRAME_PAYLOAD) willEncrypt = false;
             if (!willEncrypt && !force) {
-                xSemaphoreGiveRecursive(stateMutex);
                 req->send(409, "text/plain", "PLAINTEXT_FALLBACK"); return;
             }
         }
-
-        if (type == "SOS") {
-            sendSecureOrPlain(MSG_SOS_MEDIC, target, nullptr, 0);
-        } else if (type == "CHAT") {
-            if (msg.length() > MAX_MESSAGE_BYTES) {
-                xSemaphoreGiveRecursive(stateMutex);
-                req->send(413, "text/plain", "msg troppo lungo"); return;
-            }
+        if (type == "SOS") sendSecureOrPlain(MSG_SOS_MEDIC, target, nullptr, 0);
+        else if (type == "CHAT") {
+            if (msg.length() > MAX_MESSAGE_BYTES) { req->send(413,"text/plain","msg long"); return; }
             sendSecureOrPlain(MSG_CHAT, target, (const uint8_t*)msg.c_str(), msg.length());
-        } else if (type == "KEY") {
-            if (target == BROADCAST_ID) {
-                xSemaphoreGiveRecursive(stateMutex);
-                req->send(400, "text/plain", "no broadcast handshake"); return;
-            }
-            kyberEnsureKeypair();
-            outgoingStart(MSG_KYBER_PUBKEY, target, g_kyber_pk, KYBER_PK_SIZE, FLAG_RELAY_OK);
         } else {
-            xSemaphoreGiveRecursive(stateMutex);
-            req->send(400, "text/plain", "tipo sconosciuto"); return;
+            req->send(400,"text/plain","tipo"); return;
         }
-        xSemaphoreGiveRecursive(stateMutex);
         req->send(200, "text/plain", "ok");
     });
-
     server.begin();
-
-    // UDP data transport
-    g_udp.begin(UDP_DATA_PORT);
-    g_wifiReady = true;
-    Serial.printf("[WiFi] UDP data port %d ready\n", UDP_DATA_PORT);
 }
 
 // ============================================================================
-// 26. SERIAL
+// 27. SERIAL
 // ============================================================================
 static void serialTick() {
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
     while (Serial.available()) {
         int c = Serial.read();
         switch (c) {
@@ -1576,10 +2230,8 @@ static void serialTick() {
                 sendSecureOrPlain(MSG_CHAT, BROADCAST_ID, (const uint8_t*)m, strlen(m));
                 break;
             }
-            case 'k':
-                kyberEnsureKeypair();
-                Serial.println("[KYBER] PK ready");
-                break;
+            case 'k': kyberEnsureKeypair(); Serial.println("[KYBER] PK ready"); break;
+            case 'x': x25519EnsureKeypair(); Serial.println("[X25519] PK ready"); break;
             case 'i':
                 Serial.printf("FEC=%u INT=%u foreign=%lu crc=%lu\n",
                               DynamicFEC(interference_level), interference_level,
@@ -1588,34 +2240,48 @@ static void serialTick() {
                 break;
             case 'p':
                 for (int i = 0; i < MAX_PEERS; i++)
-                    if (peers[i].inUse)
-                        Serial.printf("peer %08X est=%d via=%s last_rx=%u\n",
-                                      peers[i].peerID, peers[i].established,
+                    if (peers[i].state != PEER_NONE)
+                        Serial.printf("peer %08X [%s] via=%s x25519=%d\n",
+                                      peers[i].peerID, peerStateName(peers[i].state),
                                       protoName(peers[i].lastSeenProto),
-                                      peers[i].last_rx_seq);
+                                      peers[i].has_x25519_pk);
                 break;
-            case 'o':
-                for (int i = 0; i < ONION_TRACKER_SIZE; i++)
-                    if (g_onionTrackers[i].active)
-                        Serial.printf("onion pending token=%08X target=%08X age=%lu\n",
-                                      g_onionTrackers[i].token,
-                                      g_onionTrackers[i].targetID,
-                                      (unsigned long)(nowMs() - g_onionTrackers[i].sentAt));
+            case 'A': {
+                int idx = 0;
+                for (int i = 0; i < MAX_PEERS; i++)
+                    if (peers[i].state == PEER_PENDING_IN)
+                        Serial.printf("[%d] pending-in %08X\n", idx++, peers[i].peerID);
+                if (!idx) Serial.println("nessun pending");
                 break;
-            case 'w':
-                Serial.printf("LoRa:%d WiFi:%d BT:%d (bleConn:%d)\n",
-                              g_loraReady, g_wifiReady, g_btReady, g_bleConnected);
+            }
+            case 'a':
+                for (int i = 0; i < MAX_PEERS; i++)
+                    if (peers[i].state == PEER_PENDING_IN) { peerAcceptPending(peers[i].peerID); break; }
+                break;
+            case 'r':
+                for (int i = 0; i < MAX_PEERS; i++)
+                    if (peers[i].state == PEER_PENDING_IN) { peerRejectPending(peers[i].peerID); break; }
+                break;
+            case 'P':
+                Serial.printf("policy=%s wl=%u bl=%u\n",
+                              policyName(g_policy), g_whitelist_count, g_blocklist_count);
+                break;
+            case 'W':
+                Serial.printf("LoRa:%d WiFi:%d BT:%d bleConn:%d centrals:%d/%d\n",
+                              g_loraReady, g_wifiReady, g_btReady, g_bleCentralConnected,
+                              g_bleCentrals[0].active + g_bleCentrals[1].active, BLE_MAX_CENTRALS);
+                Serial.printf("WiFi STA:%s AP:%s\n",
+                              WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString().c_str() : "no",
+                              (WiFi.getMode() & WIFI_MODE_AP) ? WiFi.softAPIP().toString().c_str() : "no");
                 break;
         }
     }
-    xSemaphoreGiveRecursive(stateMutex);
 }
 
 // ============================================================================
-// 27. SLEEP
+// 28. SLEEP
 // ============================================================================
 static void enterSleep() {
-    Serial.println("[SLEEP] deep sleep");
     updateUI("SLEEP", "bye");
     delay(200);
     oled.ssd1306_command(SSD1306_DISPLAYOFF);
@@ -1623,7 +2289,6 @@ static void enterSleep() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     BLEDevice::deinit(true);
-
     esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);
     esp_sleep_enable_ext1_wakeup((1ULL << RADIO_DIO1_PIN), ESP_EXT1_WAKEUP_ANY_HIGH);
     esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
@@ -1641,23 +2306,18 @@ static void printWakeReason() {
 }
 
 // ============================================================================
-// 28. RADIO SETUP
+// 29. SETUP
 // ============================================================================
 static bool setupRadio() {
     Serial.println("[RADIO] init");
     spi.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-
-    pinMode(LORA_CS, OUTPUT);   digitalWrite(LORA_CS, HIGH);
-    pinMode(LORA_RST, OUTPUT);  digitalWrite(LORA_RST, LOW); delay(100);
-                                digitalWrite(LORA_RST, HIGH); delay(200);
+    pinMode(LORA_CS, OUTPUT);  digitalWrite(LORA_CS, HIGH);
+    pinMode(LORA_RST, OUTPUT); digitalWrite(LORA_RST, LOW); delay(100);
+                               digitalWrite(LORA_RST, HIGH); delay(200);
     pinMode(LORA_BUSY, INPUT);
     delay(50);
-
     int st = radio.begin(868.0, 125.0, 9, DynamicFEC(interference_level), 0x12, 10, 8);
-    if (st != RADIOLIB_ERR_NONE) {
-        Serial.printf("[RADIO] begin err=%d\n", st);
-        return false;
-    }
+    if (st != RADIOLIB_ERR_NONE) { Serial.printf("[RADIO] err=%d\n", st); return false; }
     radio.setCRC(true);
     radio.setOutputPower(10);
     delay(50);
@@ -1667,22 +2327,13 @@ static bool setupRadio() {
     return true;
 }
 
-// ============================================================================
-// 29. OLED SETUP
-// ============================================================================
 static void setupOLED() {
-    pinMode(OLED_PWR, OUTPUT);
-    digitalWrite(OLED_PWR, LOW);
-    delay(300);
-
-    pinMode(OLED_RST, OUTPUT);
-    digitalWrite(OLED_RST, LOW);  delay(100);
-    digitalWrite(OLED_RST, HIGH); delay(200);
-
+    pinMode(OLED_PWR, OUTPUT); digitalWrite(OLED_PWR, LOW); delay(300);
+    pinMode(OLED_RST, OUTPUT); digitalWrite(OLED_RST, LOW); delay(100);
+                               digitalWrite(OLED_RST, HIGH); delay(200);
     Wire.begin(OLED_SDA, OLED_SCL);
     Wire.setClock(100000);
     delay(100);
-
     oled.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, false);
     oled.clearDisplay();
     oled.setTextSize(1);
@@ -1692,66 +2343,68 @@ static void setupOLED() {
     oled.display();
 }
 
-// ============================================================================
-// 30. SETUP / LOOP
-// ============================================================================
 void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== Qorlyn ===");
-    Serial.printf("GPacket=%u Incoming=%u Outgoing=%u OnionTracker=%u\n",
-                  (unsigned)sizeof(GPacket),
-                  (unsigned)sizeof(IncomingMessage),
-                  (unsigned)sizeof(OutgoingMessage),
-                  (unsigned)sizeof(OnionTracker));
+    Serial.printf("GPacket=%u Peer=%u\n", (unsigned)sizeof(GPacket), (unsigned)sizeof(PeerSession));
 
     myID = g_myID ? g_myID : generateDeviceID();
     g_myID = myID;
-    Serial.printf("myID=%08X\n", myID);
+    Serial.printf("myID=%08X policy=%s\n", myID, policyName(g_policy));
 
     stateMutex = xSemaphoreCreateRecursiveMutex();
     txQueue    = xQueueCreate(16, sizeof(TxRequest));
 
-    memset(peers, 0, sizeof(peers));
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) memset(peers, 0, sizeof(peers));
+
+    memset(g_pending, 0, sizeof(g_pending));
     memset(rxSlots, 0, sizeof(rxSlots));
     memset(outgoing, 0, sizeof(outgoing));
     memset(g_onionTrackers, 0, sizeof(g_onionTrackers));
+    memset(g_bleCentrals, 0, sizeof(g_bleCentrals));
 
     setupOLED();
     printWakeReason();
-
     if (!setupRadio()) updateUI("ERROR", "radio fail");
 
     xTaskCreatePinnedToCore(radioTask, "radio", 8192, nullptr, 2, &radioTaskHandle, 1);
 
     if (!g_kyber_ready) kyberEnsureKeypair();
-    else Serial.println("[KYBER] keypair da RTC");
+    x25519EnsureKeypair();
 
-    setupWeb();      // include g_wifiReady = true
-    bleSetup();      // include g_btReady = true
+    // WiFi setup in task (scan blocca)
+    xTaskCreatePinnedToCore(wifiSetupTask, "wifi", 8192, nullptr, 1, &wifiTaskHandle, 0);
+
+    setupWeb();
+    bleSetup();
 
     lastActivity = nowMs();
-    updateUI("READY", "online");
-    Serial.printf("[BOOT] LoRa:%d WiFi:%d BT:%d\n", g_loraReady, g_wifiReady, g_btReady);
+    updateUI("READY", policyName(g_policy));
 }
 
 void loop() {
     if (nowMs() - lastActivity > 10UL * 60UL * 1000UL) enterSleep();
 
-    outgoingTick();
-    rxSlotsSweep();
-    peersSweep();
-    onionTrackerSweep();
-    heartbeatTick();
-    serialTick();
+    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) == pdTRUE) {
+        outgoingTick();
+        rxSlotsSweep();
+        peersSweep();
+        onionTrackerSweep();
+        heartbeatTick();
+        serialTick();
+        xSemaphoreGiveRecursive(stateMutex);
+    }
     wifiDataTick();
 
     if (nowMs() < g_plaintextWarnUntil) updateUI("PLAINTEXT!", "msg in chiaro");
     else {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "via %s", protoName(g_lastRxProto));
-        updateUI("READY", buf);
+        int pend = 0;
+        for (int i = 0; i < MAX_PEERS; i++) if (peers[i].state == PEER_PENDING_IN) pend++;
+        char b[24];
+        if (pend) { snprintf(b, sizeof(b), "%d richieste", pend); updateUI("PENDING", b); }
+        else { snprintf(b, sizeof(b), "via %s", protoName(g_lastRxProto)); updateUI("READY", b); }
     }
-
     delay(20);
 }
