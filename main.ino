@@ -1,6 +1,6 @@
 /* ============================================================================
  * (C) Qorlyn 2026. Last update: 12:50:48 04/10/2026 (dd/mm/yyyy) (Italian time)
- * ML-KEM (Kyber-512) + AES-256-GCM (con AAD) + Full Onion Routing (multi-frame)
+ * ML-KEM (Kyber-512) + AES-256-GCM (con AAD) + Full Onion Routing + E2E ACK
  * ----------------------------------------------------------------------------
  * Connect with us:
  *   🌐 Website:  https://qorlyn.org
@@ -10,7 +10,7 @@
  *    @ Telegram: qorlyn.org/telegram
  *    @ GitHub:   qorlyn.org/github
  *    Donate:     qorlyn.org/donate
- NOTE: THIS CODE IS NOT TESTED. 
+ NOTE: THIS CODE IS NOT TESTED.
  * ==========================================================================*/
 
 #include <Arduino.h>
@@ -70,7 +70,7 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 #define BROADCAST_ID         0xFFFFFFFFu
 
 #define CACHE_SIZE           32
-#define MAX_PEERS            6
+#define MAX_PEERS            12
 #define MAX_OUTGOING         3
 #define ACK_TIMEOUT_MS       3000
 #define ACK_MAX_RETRIES      3
@@ -81,13 +81,16 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 #define KYBER_SK_SIZE        1632
 #define KYBER_CT_SIZE        768
 
-// Onion
-#define ONION_MAX_INTERMEDIATES 2
-#define ONION_MAX_PATH          (ONION_MAX_INTERMEDIATES + 1)   // 3
-#define ONION_LAYER_HDR         7                               // next(4)+type(1)+len(2)
-#define ONION_LAYER_OVERHEAD    (ONION_LAYER_HDR + 28)          // +IV+tag
-#define ONION_AAD_LEN           9                               // ver(1)+sender(4)+hop(4)
-#define ONION_MAX_PAYLOAD       (MAX_MESSAGE_BYTES - ONION_LAYER_OVERHEAD * ONION_MAX_PATH)
+// Onion (layer: next_hop 4 + type 1 + flags 1 + len 2 = 8B; + IV/tag 28B)
+#define ONION_MAX_HOPS          6       // 5 intermedi + target
+#define ONION_LAYER_HDR         8
+#define ONION_LAYER_OVERHEAD    (ONION_LAYER_HDR + 28)   // 36
+#define ONION_AAD_LEN           9
+#define ONION_TOKEN_LEN         4
+#define ONION_MAX_PAYLOAD       (MAX_MESSAGE_BYTES - ONION_LAYER_OVERHEAD * ONION_MAX_HOPS - ONION_TOKEN_LEN)
+
+#define ONION_TRACKER_SIZE      4
+#define ONION_TRACKER_TTL       60000UL
 
 #define WIFI_SSID_PREFIX     "G-TALK-"
 #define WIFI_PASSWORD        "gmesh2026"
@@ -105,7 +108,8 @@ enum GMessageType : uint8_t {
     MSG_CHAT            = 0x1C,
     MSG_KYBER_PUBKEY    = 0x20,
     MSG_KYBER_CIPHERTEXT= 0x21,
-    MSG_ONION           = 0x22
+    MSG_ONION           = 0x22,
+    MSG_ONION_ACK       = 0x23
 };
 
 enum PacketFlags : uint8_t {
@@ -115,6 +119,10 @@ enum PacketFlags : uint8_t {
     FLAG_BROADCAST      = 0x08,
     FLAG_PLAINTEXT_WARN = 0x10,
     FLAG_NO_RETRY       = 0x20
+};
+
+enum OnionFlags : uint8_t {
+    ONION_FLAG_ACK_REQ  = 0x01
 };
 
 // ============================================================================
@@ -175,6 +183,13 @@ struct OutgoingMessage {
 
 struct TxRequest { GPacket packet; };
 
+struct OnionTracker {
+    bool     active;
+    uint32_t token;
+    uint32_t targetID;
+    unsigned long sentAt;
+};
+
 // ============================================================================
 // 5. GLOBALI
 // ============================================================================
@@ -195,6 +210,7 @@ AsyncWebServer    server(80);
 PeerSession      peers[MAX_PEERS];
 IncomingMessage  rxSlots[RX_SLOT_COUNT];
 OutgoingMessage  outgoing[MAX_OUTGOING];
+OnionTracker     g_onionTrackers[ONION_TRACKER_SIZE];
 
 uint32_t dedupCache[CACHE_SIZE] = {0};
 uint8_t  dedupIdx = 0;
@@ -206,10 +222,11 @@ volatile uint8_t  interference_level    = 1;
 unsigned long lastActivity = 0;
 unsigned long g_plaintextWarnUntil = 0;
 
-// Buffer statici per onion (protetti da stateMutex)
-static uint8_t s_onionA[MAX_MESSAGE_BYTES];
-static uint8_t s_onionB[MAX_MESSAGE_BYTES];
-static uint8_t s_onionPlain[MAX_MESSAGE_BYTES];
+// Buffer statici (protteti da stateMutex). +64 di margine.
+#define ONION_BUF (MAX_MESSAGE_BYTES + 64)
+static uint8_t s_onionA[ONION_BUF];
+static uint8_t s_onionB[ONION_BUF];
+static uint8_t s_onionPlain[ONION_BUF];
 
 // ============================================================================
 // 6. UTILITY
@@ -245,9 +262,8 @@ static void updateUI(const char* status, const char* info, float rssi = 0, float
     oled.setCursor(0, 10);
     oled.print("Sec: ");
     bool anySecure = false;
-    for (int i = 0; i < MAX_PEERS; i++) {
+    for (int i = 0; i < MAX_PEERS; i++)
         if (peers[i].inUse && peers[i].established) { anySecure = true; break; }
-    }
     oled.print(anySecure ? "KYBER+GCM" : "OFF");
     oled.setCursor(0, 22);
     oled.printf("FEC:%u INT:%u", DynamicFEC(interference_level), interference_level);
@@ -398,12 +414,11 @@ static bool decryptGCM_AAD(const uint8_t* key, const GPacket& p,
     return true;
 }
 
-// AES-GCM generico con AAD esplicito (per layer onion)
 static bool gcmEncryptAAD(const uint8_t* key,
                           const uint8_t* aad, size_t aadLen,
                           const uint8_t* plaintext, uint16_t len,
                           uint8_t* out, uint16_t& outLen) {
-    if (len + ENC_OVERHEAD > FRAME_PAYLOAD) return false;
+    if (len + ENC_OVERHEAD > ONION_BUF) return false;
     mbedtls_gcm_context gcm;
     mbedtls_gcm_init(&gcm);
     if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256) != 0) {
@@ -483,12 +498,8 @@ static void radioTask(void*) {
         if (st == RADIOLIB_ERR_NONE) {
             if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION) {
                 handleReceivedPacket(p, radio.getRSSI(), radio.getSNR());
-            } else {
-                crc_error_count++;
-            }
-        } else if (st == RADIOLIB_ERR_CRC_MISMATCH) {
-            crc_error_count++;
-        }
+            } else crc_error_count++;
+        } else if (st == RADIOLIB_ERR_CRC_MISMATCH) crc_error_count++;
         recalcInterference();
         vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -598,10 +609,7 @@ static void outgoingTick() {
         if (!o->active) continue;
         if (t - o->lastSend < ACK_TIMEOUT_MS) continue;
 
-        if (o->flags & FLAG_NO_RETRY) {
-            outgoingFree(o);
-            continue;
-        }
+        if (o->flags & FLAG_NO_RETRY) { outgoingFree(o); continue; }
 
         uint8_t need = (1u << o->totalFrames) - 1;
         uint8_t missing = need & ~o->ackedMask;
@@ -661,7 +669,6 @@ static void sendAckBitmap(uint32_t target, uint16_t session, uint8_t mask) {
     enqueueTx(p);
 }
 
-// Forward
 static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len);
 
 static void handlePacketReassembly(GPacket& p) {
@@ -693,12 +700,58 @@ static void handlePacketReassembly(GPacket& p) {
 }
 
 // ============================================================================
-// 15. ONION ROUTING
+// 15. ONION TRACKER (per ACK end-to-end)
+// ============================================================================
+static void onionTrackerSweep() {
+    unsigned long t = nowMs();
+    for (int i = 0; i < ONION_TRACKER_SIZE; i++) {
+        if (g_onionTrackers[i].active && (t - g_onionTrackers[i].sentAt) > ONION_TRACKER_TTL) {
+            Serial.printf("[ONION] ACK timeout token=%08X target=%08X\n",
+                          g_onionTrackers[i].token, g_onionTrackers[i].targetID);
+            g_onionTrackers[i].active = false;
+        }
+    }
+}
+
+static uint32_t onionTrackerAdd(uint32_t targetID) {
+    // Trova slot libero (o il più vecchio)
+    int slot = -1;
+    for (int i = 0; i < ONION_TRACKER_SIZE; i++)
+        if (!g_onionTrackers[i].active) { slot = i; break; }
+    if (slot < 0) {
+        unsigned long oldestT = ULONG_MAX;
+        for (int i = 0; i < ONION_TRACKER_SIZE; i++)
+            if (g_onionTrackers[i].sentAt < oldestT) {
+                oldestT = g_onionTrackers[i].sentAt; slot = i;
+            }
+    }
+    uint32_t token;
+    do { token = esp_random(); } while (token == 0);
+    g_onionTrackers[slot].active = true;
+    g_onionTrackers[slot].token = token;
+    g_onionTrackers[slot].targetID = targetID;
+    g_onionTrackers[slot].sentAt = nowMs();
+    return token;
+}
+
+static bool onionTrackerConsume(uint32_t token) {
+    for (int i = 0; i < ONION_TRACKER_SIZE; i++) {
+        if (g_onionTrackers[i].active && g_onionTrackers[i].token == token) {
+            g_onionTrackers[i].active = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// 16. ONION ROUTING
 // ----------------------------------------------------------------------------
-// Layer (dopo decifratura): [next_hop:4][type:1][len:2][payload]
+// Layer (dopo decifratura): [next_hop:4][type:1][flags:1][len:2][payload]
 //   next_hop == 0  -> siamo destinatario finale
 //   next_hop != 0  -> forward
 // AAD layer = [version:1][orig_sender:4][this_hop:4]
+// flags & ONION_FLAG_ACK_REQ (solo innermost) -> il payload inizia con 4B token
 // Multi-frame nativo via outgoingStart.
 // ============================================================================
 
@@ -711,31 +764,10 @@ static void buildOnionAAD(uint32_t origSender, uint32_t thisHop,
     aadLen = i;
 }
 
-// Dispatch di un payload consegnato dall'onion (già autenticato dal layer GCM)
+// Forward decl
 static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
-                                   uint8_t* data, uint16_t len) {
-    switch (type) {
-        case MSG_HEARTBEAT:
-            Serial.printf("[ONION] HB da %08X\n", origSender);
-            break;
-        case MSG_SOS_MEDIC:
-            Serial.printf("[ONION] !!! SOS MEDICO da %08X !!!\n", origSender);
-            updateUI("SOS", "SOS (onion)");
-            break;
-        case MSG_CHAT: {
-            char buf[MAX_MESSAGE_BYTES + 1];
-            uint16_t n = len > MAX_MESSAGE_BYTES ? MAX_MESSAGE_BYTES : len;
-            memcpy(buf, data, n); buf[n] = '\0';
-            Serial.printf("[ONION] Chat da %08X: %s\n", origSender, buf);
-            updateUI("CHAT", buf);
-            break;
-        }
-        default:
-            Serial.printf("[ONION] tipo 0x%02X len=%u da %08X\n",
-                          type, len, origSender);
-            break;
-    }
-}
+                                   uint8_t* data, uint16_t len,
+                                   bool ackReq, uint32_t ackToken);
 
 static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
     if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
@@ -761,7 +793,8 @@ static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
     uint32_t nextHop = ((uint32_t)s_onionPlain[0] << 24) | ((uint32_t)s_onionPlain[1] << 16)
                      | ((uint32_t)s_onionPlain[2] <<  8) |  (uint32_t)s_onionPlain[3];
     uint8_t  nextType = s_onionPlain[4];
-    uint16_t nextLen  = ((uint16_t)s_onionPlain[5] << 8) | s_onionPlain[6];
+    uint8_t  nextFlags= s_onionPlain[5];
+    uint16_t nextLen  = ((uint16_t)s_onionPlain[6] << 8) | s_onionPlain[7];
     uint8_t* nextData = s_onionPlain + ONION_LAYER_HDR;
 
     if (nextLen > plainLen - ONION_LAYER_HDR) {
@@ -769,17 +802,37 @@ static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
         xSemaphoreGiveRecursive(stateMutex); return;
     }
 
-    // Copia ciphertext interno (s_onionPlain verrà riusato)
+    // Copia ciphertext interno
     memmove(s_onionB, nextData, nextLen);
 
     if (nextHop == 0) {
-        if (nextType == MSG_ONION || nextType == MSG_ACK) {
+        // Siamo il destinatario finale
+        if (nextType == MSG_ONION || nextType == MSG_ACK || nextType == MSG_ONION_ACK) {
             Serial.printf("[ONION] inner type forbidden 0x%02X\n", nextType);
             xSemaphoreGiveRecursive(stateMutex); return;
         }
-        dispatchOnionDelivered(origSender, nextType, s_onionB, nextLen);
-        Serial.printf("[ONION] final delivered from %08X len=%u\n", origSender, nextLen);
+
+        bool ackReq = (nextFlags & ONION_FLAG_ACK_REQ) != 0;
+        uint32_t ackToken = 0;
+        uint8_t* userData = s_onionB;
+        uint16_t userLen = nextLen;
+
+        if (ackReq) {
+            if (nextLen < ONION_TOKEN_LEN) {
+                Serial.println("[ONION] ack token mancante");
+                xSemaphoreGiveRecursive(stateMutex); return;
+            }
+            ackToken = ((uint32_t)s_onionB[0] << 24) | ((uint32_t)s_onionB[1] << 16)
+                     | ((uint32_t)s_onionB[2] <<  8) |  (uint32_t)s_onionB[3];
+            userData = s_onionB + ONION_TOKEN_LEN;
+            userLen  = nextLen - ONION_TOKEN_LEN;
+        }
+
+        dispatchOnionDelivered(origSender, nextType, userData, userLen, ackReq, ackToken);
+        Serial.printf("[ONION] final delivered from %08X len=%u ackReq=%d\n",
+                      origSender, userLen, ackReq ? 1 : 0);
     } else {
+        // Relay
         if (nextType != MSG_ONION) {
             Serial.printf("[ONION] inner non-onion 0x%02X\n", nextType);
             xSemaphoreGiveRecursive(stateMutex); return;
@@ -794,18 +847,19 @@ static void handleOnionLayer(uint32_t origSender, uint8_t* data, uint16_t len) {
 
 static bool onionSend(GMessageType finalType, uint32_t target,
                       const uint8_t* data, uint16_t dataLen,
-                      const uint32_t* hops, uint8_t nHops) {
+                      const uint32_t* hops, uint8_t nHops,
+                      bool ackReq) {
     if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return false;
 
-    if (nHops > ONION_MAX_INTERMEDIATES) {
-        Serial.println("[ONION] too many hops");
+    uint8_t pathLen = nHops + 1;
+    if (pathLen > ONION_MAX_HOPS) {
+        Serial.printf("[ONION] too many hops (%u > %u)\n", pathLen, ONION_MAX_HOPS);
         xSemaphoreGiveRecursive(stateMutex); return false;
     }
 
-    uint32_t path[ONION_MAX_PATH];
+    uint32_t path[ONION_MAX_HOPS];
     for (uint8_t i = 0; i < nHops; i++) path[i] = hops[i];
     path[nHops] = target;
-    uint8_t pathLen = nHops + 1;
 
     for (uint8_t i = 0; i < pathLen; i++) {
         if (path[i] == BROADCAST_ID) {
@@ -819,23 +873,37 @@ static bool onionSend(GMessageType finalType, uint32_t target,
         }
     }
 
-    uint16_t maxPayload = MAX_MESSAGE_BYTES - ONION_LAYER_OVERHEAD * pathLen;
-    if (dataLen > maxPayload) {
-        Serial.printf("[ONION] payload %u > %u\n", dataLen, maxPayload);
+    uint16_t overhead = ONION_LAYER_OVERHEAD * pathLen + (ackReq ? ONION_TOKEN_LEN : 0);
+    if (dataLen + overhead > MAX_MESSAGE_BYTES) {
+        Serial.printf("[ONION] payload %u too big (path=%u ack=%d)\n",
+                      dataLen, pathLen, ackReq ? 1 : 0);
         xSemaphoreGiveRecursive(stateMutex); return false;
+    }
+
+    uint32_t ackToken = 0;
+    if (ackReq) {
+        ackToken = onionTrackerAdd(target);
     }
 
     uint16_t bufLen = 0;
     uint8_t* cur = s_onionA;
     uint8_t* nxt = s_onionB;
 
-    // Layer 0: per il target
+    // --- Layer 0 (innermost, per il target) ---
     {
         uint16_t i = 0;
-        nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0;
+        nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0; nxt[i++] = 0;  // next_hop = 0
         nxt[i++] = (uint8_t)finalType;
-        nxt[i++] = (dataLen >> 8) & 0xFF;
-        nxt[i++] = dataLen & 0xFF;
+        nxt[i++] = ackReq ? ONION_FLAG_ACK_REQ : 0;
+        uint16_t innerLen = (ackReq ? ONION_TOKEN_LEN : 0) + dataLen;
+        nxt[i++] = (innerLen >> 8) & 0xFF;
+        nxt[i++] = innerLen & 0xFF;
+        if (ackReq) {
+            nxt[i++] = (ackToken >> 24) & 0xFF;
+            nxt[i++] = (ackToken >> 16) & 0xFF;
+            nxt[i++] = (ackToken >>  8) & 0xFF;
+            nxt[i++] = (ackToken      ) & 0xFF;
+        }
         if (dataLen) { memcpy(nxt + i, data, dataLen); i += dataLen; }
 
         PeerSession* tps = peerFind(target);
@@ -849,7 +917,7 @@ static bool onionSend(GMessageType finalType, uint32_t target,
         bufLen = outLen;
     }
 
-    // Layer intermedi (dal più interno al più esterno)
+    // --- Layer intermedi (dal più interno al più esterno) ---
     for (int i = (int)nHops - 1; i >= 0; i--) {
         PeerSession* ps = peerFind(path[i]);
         uint32_t nextHop = path[i + 1];
@@ -860,6 +928,7 @@ static bool onionSend(GMessageType finalType, uint32_t target,
         nxt[j++] = (nextHop >>  8) & 0xFF;
         nxt[j++] = (nextHop      ) & 0xFF;
         nxt[j++] = (uint8_t)MSG_ONION;
+        nxt[j++] = 0;  // flags
         nxt[j++] = (bufLen >> 8) & 0xFF;
         nxt[j++] = bufLen & 0xFF;
         memcpy(nxt + j, cur, bufLen); j += bufLen;
@@ -875,7 +944,9 @@ static bool onionSend(GMessageType finalType, uint32_t target,
     }
 
     uint32_t firstHop = (nHops > 0) ? path[0] : target;
-    Serial.printf("[ONION] send pathLen=%u target=%08X len=%u\n", pathLen, target, bufLen);
+    Serial.printf("[ONION] send path=%u target=%08X len=%u ack=%d token=%08X\n",
+                  pathLen, target, bufLen, ackReq ? 1 : 0, ackToken);
+
     outgoingStart(MSG_ONION, firstHop, cur, bufLen,
                   FLAG_RELAY_OK | FLAG_NO_RETRY, false);
 
@@ -884,7 +955,67 @@ static bool onionSend(GMessageType finalType, uint32_t target,
 }
 
 // ============================================================================
-// 16. FINAL MESSAGE DISPATCH
+// 17. ONION DELIVERY + ACK E2E
+// ============================================================================
+static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
+                                   uint8_t* data, uint16_t len,
+                                   bool ackReq, uint32_t ackToken) {
+    // Se ACK richiesto: manda MSG_ONION_ACK cifrato direttamente a origSender
+    if (ackReq) {
+        uint8_t ackPayload[ONION_TOKEN_LEN];
+        ackPayload[0] = (ackToken >> 24) & 0xFF;
+        ackPayload[1] = (ackToken >> 16) & 0xFF;
+        ackPayload[2] = (ackToken >>  8) & 0xFF;
+        ackPayload[3] = (ackToken      ) & 0xFF;
+
+        // Cifra con sessione S<->T (già esistente)
+        PeerSession* ps = peerFind(origSender);
+        if (ps && ps->established && len + ENC_OVERHEAD <= FRAME_PAYLOAD) {
+            uint8_t flags = FLAG_RELAY_OK | FLAG_ENCRYPTED;
+            uint16_t sessionID = ++g_sessionCounter;
+            uint32_t seq = ps->tx_seq++;
+            GPacket p = buildHeader(MSG_ONION_ACK, origSender, 1, 0,
+                                    ONION_TOKEN_LEN + ENC_OVERHEAD, flags,
+                                    sessionID, seq, DEFAULT_TTL);
+            uint8_t blob[FRAME_PAYLOAD];
+            uint16_t blobLen = 0;
+            if (encryptGCM_AAD(ps->shared_secret, p, ackPayload, ONION_TOKEN_LEN,
+                               blob, blobLen)) {
+                memcpy(p.payload, blob, blobLen);
+                p.payloadLen = blobLen;
+                enqueueTx(p);
+                Serial.printf("[ONION] ACK inviato a %08X token=%08X\n",
+                              origSender, ackToken);
+            }
+        }
+    }
+
+    // Dispatch del messaggio utente
+    switch (type) {
+        case MSG_HEARTBEAT:
+            Serial.printf("[ONION] HB da %08X\n", origSender);
+            break;
+        case MSG_SOS_MEDIC:
+            Serial.printf("[ONION] !!! SOS MEDICO da %08X !!!\n", origSender);
+            updateUI("SOS", "SOS (onion)");
+            break;
+        case MSG_CHAT: {
+            char buf[MAX_MESSAGE_BYTES + 1];
+            uint16_t n = len > MAX_MESSAGE_BYTES ? MAX_MESSAGE_BYTES : len;
+            memcpy(buf, data, n); buf[n] = '\0';
+            Serial.printf("[ONION] Chat da %08X: %s\n", origSender, buf);
+            updateUI("CHAT", buf);
+            break;
+        }
+        default:
+            Serial.printf("[ONION] tipo 0x%02X len=%u da %08X\n",
+                          type, len, origSender);
+            break;
+    }
+}
+
+// ============================================================================
+// 18. FINAL MESSAGE DISPATCH
 // ============================================================================
 static void handleKeyExchange(uint8_t type, const uint8_t* data, uint16_t len,
                               uint32_t remoteID) {
@@ -914,7 +1045,6 @@ static void handleKeyExchange(uint8_t type, const uint8_t* data, uint16_t len,
     }
 }
 
-// Dispatch di un messaggio finale con header completo (per AAD)
 static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
     uint8_t  type   = frame.msgType;
     uint32_t sender = frame.senderID;
@@ -936,7 +1066,7 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
     }
     if (type == MSG_NACK) { Serial.printf("[RX] NACK %08X\n", sender); return; }
 
-    // Avviso plaintext unicast
+    // Plaintext warn
     if (!(frame.flags & FLAG_ENCRYPTED) && (frame.flags & FLAG_PLAINTEXT_WARN)
         && frame.targetID != BROADCAST_ID) {
         Serial.printf("[RX] *** PLAINTEXT da %08X ***\n", sender);
@@ -984,6 +1114,22 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
             updateUI("CHAT", buf);
             break;
         }
+        case MSG_ONION_ACK: {
+            if (plainLen < ONION_TOKEN_LEN) {
+                Serial.println("[ONION] ACK malformato");
+                break;
+            }
+            uint32_t tok = ((uint32_t)plain[0] << 24) | ((uint32_t)plain[1] << 16)
+                         | ((uint32_t)plain[2] <<  8) |  (uint32_t)plain[3];
+            if (onionTrackerConsume(tok)) {
+                Serial.printf("[ONION] *** ACK E2E ricevuto da %08X token=%08X ***\n",
+                              sender, tok);
+                updateUI("ONION ACK", "delivered");
+            } else {
+                Serial.printf("[ONION] ACK sconosciuto token=%08X\n", tok);
+            }
+            break;
+        }
         default:
             Serial.printf("[RX] type 0x%02X len=%u\n", type, plainLen);
             break;
@@ -991,7 +1137,7 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
 }
 
 // ============================================================================
-// 17. RICEZIONE
+// 19. RICEZIONE
 // ============================================================================
 static void handleReceivedPacket(GPacket& p, float rssi, float snr) {
     if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
@@ -1005,7 +1151,7 @@ static void handleReceivedPacket(GPacket& p, float rssi, float snr) {
 
     if (!forMe) foreign_packets_count++;
 
-    // Relay generico (non onion: gli onion sono gestiti dal layer logico)
+    // Relay generico (non onion). MSG_ONION è relayato solo dal layer logico.
     if (relayable && p.targetID != myID && p.msgType != MSG_ONION) {
         GPacket r = p; r.ttl--; enqueueTx(r);
     }
@@ -1018,7 +1164,7 @@ static void handleReceivedPacket(GPacket& p, float rssi, float snr) {
 }
 
 // ============================================================================
-// 18. SEND SECURE OR PLAIN
+// 20. SEND SECURE OR PLAIN
 // ============================================================================
 static void sendSecureOrPlain(GMessageType type, uint32_t target,
                               const uint8_t* data, uint16_t len) {
@@ -1057,7 +1203,7 @@ static void sendSecureOrPlain(GMessageType type, uint32_t target,
 }
 
 // ============================================================================
-// 19. HEARTBEAT
+// 21. HEARTBEAT
 // ============================================================================
 static unsigned long lastHeartbeat = 0;
 static void heartbeatTick() {
@@ -1071,7 +1217,7 @@ static void heartbeatTick() {
 }
 
 // ============================================================================
-// 20. WEB UI
+// 22. WEB UI
 // ============================================================================
 static bool webAuth(AsyncWebServerRequest* r) {
     if (!r->authenticate(WEB_USER, WEB_PASS)) {
@@ -1117,15 +1263,17 @@ static void setupWeb() {
         h += "button{padding:14px 20px;margin:6px;border:none;border-radius:6px;font-size:16px;cursor:pointer}";
         h += ".sos{background:#d32f2f;color:#fff}.msg{background:#388e3c;color:#fff}";
         h += ".key{background:#fbc02d;color:#000}.onion{background:#5e35b1;color:#fff}";
-        h += "input{padding:10px;width:85%;margin:6px;border-radius:6px;border:none}";
+        h += "input[type=text]{padding:10px;width:85%;margin:6px;border-radius:6px;border:none}";
         h += ".hint{font-size:12px;color:#888;margin-top:4px}";
+        h += "label{display:inline-block;margin:8px}";
         h += "</style></head><body>";
         char idbuf[16]; sprintf(idbuf, "%08X", myID);
         h += "<h2>Qorlyn</h2><div>ID: "; h += idbuf; h += "</div>";
-        h += "<input id='t' placeholder='Target ID (hex)' value='FFFFFFFF'>";
-        h += "<input id='hops' placeholder='Onion hops (hex, comma sep.)' value=''>";
-        h += "<div class='hint'>es. <code>DEADBEEF,12345678</code> = 2 hop intermedi</div>";
-        h += "<input id='m' placeholder='Messaggio'>";
+        h += "<input type='text' id='t' placeholder='Target ID (hex)' value='FFFFFFFF'>";
+        h += "<input type='text' id='hops' placeholder='Onion hops (hex, comma sep.)' value=''>";
+        h += "<div class='hint'>es. <code>DEADBEEF,12345678</code> = 2 hop intermedi (max 5)</div>";
+        h += "<input type='text' id='m' placeholder='Messaggio'>";
+        h += "<label><input type='checkbox' id='ack' checked> Richiedi ACK end-to-end</label>";
         h += "<br><button class='msg' onclick=\"s('CHAT')\">CHAT</button>";
         h += "<button class='sos' onclick=\"s('SOS')\">SOS MEDICO</button>";
         h += "<button class='key' onclick=\"s('KEY')\">HANDSHAKE KYBER</button>";
@@ -1135,6 +1283,7 @@ static void setupWeb() {
         h += "var tg=document.getElementById('t').value;";
         h += "var hp=document.getElementById('hops').value;";
         h += "var msg=document.getElementById('m').value;";
+        h += "var ack=document.getElementById('ack').checked?'1':'0';";
         h += "send(false);";
         h += "function send(force){";
         h += "fetch('/send',{method:'POST',";
@@ -1142,6 +1291,7 @@ static void setupWeb() {
         h += "body:'type='+encodeURIComponent(t)+";
         h += "'&target='+encodeURIComponent(tg)+";
         h += "'&hops='+encodeURIComponent(hp)+";
+        h += "'&ack='+ack+";
         h += "'&msg='+encodeURIComponent(msg)+";
         h += "'&force='+(force?1:0)}).then(function(r){";
         h += "if(r.status===409){";
@@ -1166,6 +1316,7 @@ static void setupWeb() {
         String tstr    = req->getParam("target", true)->value();
         String hopsStr = req->hasParam("hops", true) ? req->getParam("hops", true)->value() : "";
         String msg     = req->hasParam("msg", true) ? req->getParam("msg", true)->value() : "";
+        bool ackReq    = req->hasParam("ack", true) && req->getParam("ack", true)->value() == "1";
         bool force     = req->hasParam("force", true) && req->getParam("force", true)->value() == "1";
 
         char* endp = nullptr;
@@ -1181,8 +1332,8 @@ static void setupWeb() {
         }
 
         if (type == "ONION") {
-            uint32_t hops[ONION_MAX_INTERMEDIATES];
-            uint8_t nHops = parseHops(hopsStr, hops, ONION_MAX_INTERMEDIATES);
+            uint32_t hops[ONION_MAX_HOPS - 1];
+            uint8_t nHops = parseHops(hopsStr, hops, ONION_MAX_HOPS - 1);
             if (msg.length() > MAX_MESSAGE_BYTES) {
                 xSemaphoreGiveRecursive(stateMutex);
                 req->send(413, "text/plain", "msg troppo lungo");
@@ -1190,14 +1341,14 @@ static void setupWeb() {
             }
             bool ok = onionSend(MSG_CHAT, target,
                                 (const uint8_t*)msg.c_str(), msg.length(),
-                                hops, nHops);
+                                hops, nHops, ackReq);
             xSemaphoreGiveRecursive(stateMutex);
             if (!ok) { req->send(400, "text/plain", "onion send failed"); return; }
             req->send(200, "text/plain", "ok");
             return;
         }
 
-        // Check plaintext fallback per SOS/CHAT unicast
+        // Check plaintext fallback
         if ((type == "SOS" || type == "CHAT") && target != BROADCAST_ID) {
             PeerSession* ps = peerFind(target);
             bool willEncrypt = (ps && ps->established);
@@ -1242,7 +1393,7 @@ static void setupWeb() {
 }
 
 // ============================================================================
-// 21. SERIAL
+// 23. SERIAL
 // ============================================================================
 static void serialTick() {
     if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) != pdTRUE) return;
@@ -1271,13 +1422,21 @@ static void serialTick() {
                                       peers[i].peerID, peers[i].established,
                                       peers[i].last_rx_seq);
                 break;
+            case 'o':
+                for (int i = 0; i < ONION_TRACKER_SIZE; i++)
+                    if (g_onionTrackers[i].active)
+                        Serial.printf("onion pending token=%08X target=%08X age=%lu\n",
+                                      g_onionTrackers[i].token,
+                                      g_onionTrackers[i].targetID,
+                                      (unsigned long)(nowMs() - g_onionTrackers[i].sentAt));
+                break;
         }
     }
     xSemaphoreGiveRecursive(stateMutex);
 }
 
 // ============================================================================
-// 22. SLEEP
+// 24. SLEEP
 // ============================================================================
 static void enterSleep() {
     Serial.println("[SLEEP] deep sleep");
@@ -1305,7 +1464,7 @@ static void printWakeReason() {
 }
 
 // ============================================================================
-// 23. RADIO SETUP
+// 25. RADIO SETUP
 // ============================================================================
 static bool setupRadio() {
     Serial.println("[RADIO] init");
@@ -1331,7 +1490,7 @@ static bool setupRadio() {
 }
 
 // ============================================================================
-// 24. OLED SETUP
+// 26. OLED SETUP
 // ============================================================================
 static void setupOLED() {
     pinMode(OLED_PWR, OUTPUT);
@@ -1356,18 +1515,19 @@ static void setupOLED() {
 }
 
 // ============================================================================
-// 25. SETUP / LOOP
+// 27. SETUP / LOOP
 // ============================================================================
 void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== Qorlyn ===");
-    Serial.printf("GPacket=%u Incoming=%u Outgoing=%u\n",
+    Serial.printf("GPacket=%u Incoming=%u Outgoing=%u OnionTracker=%u\n",
                   (unsigned)sizeof(GPacket),
                   (unsigned)sizeof(IncomingMessage),
-                  (unsigned)sizeof(OutgoingMessage));
-    Serial.printf("ONION max payload: %u B (path max %u)\n",
-                  (unsigned)ONION_MAX_PAYLOAD, (unsigned)ONION_MAX_PATH);
+                  (unsigned)sizeof(OutgoingMessage),
+                  (unsigned)sizeof(OnionTracker));
+    Serial.printf("ONION: max hops=%u, max payload=%u B\n",
+                  (unsigned)ONION_MAX_HOPS, (unsigned)ONION_MAX_PAYLOAD);
 
     myID = g_myID ? g_myID : generateDeviceID();
     g_myID = myID;
@@ -1379,6 +1539,7 @@ void setup() {
     memset(peers, 0, sizeof(peers));
     memset(rxSlots, 0, sizeof(rxSlots));
     memset(outgoing, 0, sizeof(outgoing));
+    memset(g_onionTrackers, 0, sizeof(g_onionTrackers));
 
     setupOLED();
     printWakeReason();
@@ -1397,12 +1558,12 @@ void setup() {
 }
 
 void loop() {
-    if (nowMs() - lastActivity > 10UL * 60UL * 1000UL)
-        enterSleep();
+    if (nowMs() - lastActivity > 10UL * 60UL * 1000UL) enterSleep();
 
     outgoingTick();
     rxSlotsSweep();
     peersSweep();
+    onionTrackerSweep();
     heartbeatTick();
     serialTick();
 
