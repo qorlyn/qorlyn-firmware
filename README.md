@@ -2,8 +2,6 @@
 
 ### The network that remains when the rest stops.
 
-**Quantum Onion Routing Lattice lYnx Network**
-
 Decentralized, post-quantum, censorship-resistant mesh communication.
 Born on the field. For those who have no alternatives.
 
