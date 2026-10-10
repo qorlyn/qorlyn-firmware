@@ -29,7 +29,7 @@ Born on the field. For those who have no alternatives.
 
 ---
 
-<img src="assets/banner.png" alt="Qorlyn — The network that remains when the rest stops" width="100%">
+<img src="assets/qorlyn social banner minimal.png" alt="Qorlyn — The network that remains when the rest stops" width="100%">
 
 ---
 
