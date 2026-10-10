@@ -1,5 +1,5 @@
 /* ============================================================================
- * Qorlyn Firmware - https://github.com/qorlyn/qorlyn-firmware
+ * Qorlyn Firmware - V.0.0.1 (Alpha)
  *
  * Copyright (C) 2026 Emanuele Ferraro (github.com/emanueleferraro)
  * Copyright (C) 2026 Qorlyn (github.com/qorlyn)
