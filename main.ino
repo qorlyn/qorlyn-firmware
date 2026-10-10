@@ -1,6 +1,8 @@
 /* ============================================================================
  * Qorlyn Firmware - https://github.com/qorlyn/qorlyn-firmware
- * Copyright (C) 2026 Emanuele Ferraro (github.com/emanueleferraro), Qorlyn (github.com/qorlyn).
+ *
+ * Copyright (C) 2026 Emanuele Ferraro (github.com/emanueleferraro)
+ * Copyright (C) 2026 Qorlyn (github.com/qorlyn)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
