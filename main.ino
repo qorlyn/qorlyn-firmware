@@ -32,6 +32,7 @@
  NOTE: CODE NOT TESTED.
  * ==========================================================================*/
 
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
 #include <Arduino.h>
 #include <esp_mac.h>
 #include <esp_sleep.h>
@@ -64,7 +65,8 @@
 #define OLED_SDA 17
 #define OLED_SCL 18
 #define OLED_RST 21
-#define OLED_PWR 32
+#define OLED_PWR 36
+//#define OLED_PWR 32
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
@@ -98,11 +100,14 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 
 #define CACHE_SIZE           32
 #define MAX_PEERS            12
-#define MAX_OUTGOING         3
+#define MAX_OUTGOING         6
 #define ACK_TIMEOUT_MS       3000
 #define ACK_MAX_RETRIES      3
 #define RX_SLOT_COUNT        4
 #define RX_SESSION_TIMEOUT   120000UL
+#define HEARTBEAT_INTERVAL_MS 30000UL
+#define LASTSEEN_RESET_MS    60000UL
+#define STA_RETRY_INTERVAL_MS 60000UL
 
 #define KYBER_PK_SIZE        800
 #define KYBER_SK_SIZE        1632
@@ -113,11 +118,11 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 
 // Onion
 #define ONION_MAX_HOPS       6
-#define ONION_LAYER_HDR      8        // next(4)+type(1)+flags(1)+len(2)
+#define ONION_LAYER_HDR      8
 #define ONION_EPH_PUB        32
-#define ONION_LAYER_OVERHEAD (ONION_EPH_PUB + 12 + 16 + ONION_LAYER_HDR)  // 68
+#define ONION_LAYER_OVERHEAD (ONION_EPH_PUB + 12 + 16 + ONION_LAYER_HDR)
 #define ONION_TOKEN_LEN      4
-#define ONION_INNER_HDR      8        // origin(4)+token(4) nel layer innermost
+#define ONION_INNER_HDR      8
 #define ONION_MAX_PAYLOAD    (MAX_MESSAGE_BYTES - ONION_LAYER_OVERHEAD * ONION_MAX_HOPS - ONION_INNER_HDR)
 #define ONION_TRACKER_SIZE   4
 #define ONION_TRACKER_TTL    60000UL
@@ -135,7 +140,7 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 #define BLE_SVC_UUID         "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_RX_CHAR_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_TX_CHAR_UUID     "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-#define BLE_MTU_PAYLOAD      480      // max chunk inviato via notify
+#define BLE_MTU_PAYLOAD      480
 #define BLE_SCAN_INTERVAL_MS 15000
 #define BLE_MAX_CENTRALS     2
 
@@ -146,6 +151,9 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi, spiSetti
 #define BLOCKLIST_MAX        8
 #define WHITELIST_MAX        8
 #define REQUEST_MIN_INTERVAL 2000UL
+
+// RTC magic per distinguere cold boot da warm reset
+#define RTC_MAGIC            0x514F524Cu
 
 // ============================================================================
 // 3. TIPI
@@ -223,8 +231,8 @@ struct __attribute__((packed)) GPacket {
 struct PeerSession {
     PeerState state;
     uint32_t  peerID;
-    uint8_t   shared_secret[32];        // Kyber
-    uint8_t   x25519_pk[X25519_KEY_SIZE]; // pubkey X25519 del peer
+    uint8_t   shared_secret[32];
+    uint8_t   x25519_pk[X25519_KEY_SIZE];
     bool      has_x25519_pk;
     uint32_t  last_rx_seq;
     uint32_t  tx_seq;
@@ -292,10 +300,12 @@ RTC_DATA_ATTR uint32_t    g_blocklist[BLOCKLIST_MAX];
 RTC_DATA_ATTR uint8_t     g_blocklist_count  = 0;
 RTC_DATA_ATTR uint32_t    g_whitelist[WHITELIST_MAX];
 RTC_DATA_ATTR uint8_t     g_whitelist_count  = 0;
+RTC_DATA_ATTR uint32_t    g_rtc_magic        = 0;
 
 uint32_t myID = 0;
 SemaphoreHandle_t stateMutex = nullptr;
 QueueHandle_t     txQueue    = nullptr;
+QueueHandle_t     bleRxQueue = nullptr;
 TaskHandle_t      radioTaskHandle = nullptr;
 TaskHandle_t      bleTaskHandle   = nullptr;
 TaskHandle_t      wifiTaskHandle  = nullptr;
@@ -323,23 +333,24 @@ bool g_loraReady = false;
 bool g_wifiReady = false;
 bool g_btReady   = false;
 volatile bool g_bleCentralConnected = false;
+volatile bool g_bleScanEnabled = true;
 uint8_t g_lastRxProto = PROTO_LORA;
 
-// BLE peripheral
 BLEServer*         g_bleServer  = nullptr;
 BLECharacteristic* g_bleTxChar  = nullptr;
 BLECharacteristic* g_bleRxChar  = nullptr;
 
-// BLE central (connessioni in uscita)
 struct BleCentralLink {
     bool           active;
     BLEClient*     client;
-    BLERemoteCharacteristic* txChar;   // notifichiamo qui
-    BLERemoteCharacteristic* rxChar;   // scriviamo qui
-    uint32_t       peerID;             // ID del peer remoto
+    BLERemoteCharacteristic* txChar;
+    BLERemoteCharacteristic* rxChar;
+    uint32_t       peerID;
     unsigned long  lastSeen;
 };
 BleCentralLink g_bleCentrals[BLE_MAX_CENTRALS];
+
+static char g_bleName[24];
 
 #define ONION_BUF (MAX_MESSAGE_BYTES + 128)
 static uint8_t s_onionA[ONION_BUF];
@@ -455,53 +466,98 @@ static bool dedupCheckAndInsert(uint32_t sender, uint16_t session, uint8_t frame
 }
 
 // ============================================================================
-// 8. X25519
+// 8. X25519 (ECP-level API)
 // ============================================================================
+static int x25519_rng(void* ctx, unsigned char* buf, size_t len) {
+    (void)ctx;
+    esp_fill_random(buf, len);
+    return 0;
+}
+
 static bool x25519GenKeypair(uint8_t* sk, uint8_t* pk) {
-    mbedtls_ecdh_context ctx;
-    mbedtls_ecdh_init(&ctx);
-    if (mbedtls_ecdh_setup(&ctx, MBEDTLS_ECP_DP_CURVE25519) != 0) {
-        mbedtls_ecdh_free(&ctx);
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_group_init(&grp);
+    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519) != 0) {
+        mbedtls_ecp_group_free(&grp);
         return false;
     }
-    unsigned char buf[64];
-    size_t olen;
-    if (mbedtls_ecdh_make_public(&ctx, &olen, buf, sizeof(buf), esp_random, NULL) != 0) {
-        mbedtls_ecdh_free(&ctx);
+    mbedtls_mpi d;
+    mbedtls_mpi_init(&d);
+    if (mbedtls_ecp_gen_privkey(&grp, &d, x25519_rng, NULL) != 0) {
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
         return false;
     }
-    memcpy(pk, buf, X25519_KEY_SIZE);
-    if (mbedtls_mpi_write_binary(&ctx.d, sk, X25519_KEY_SIZE) != 0) {
-        mbedtls_ecdh_free(&ctx);
+    mbedtls_ecp_point Q;
+    mbedtls_ecp_point_init(&Q);
+    if (mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, x25519_rng, NULL) != 0) {
+        mbedtls_ecp_point_free(&Q);
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
         return false;
     }
-    mbedtls_ecdh_free(&ctx);
+    if (mbedtls_mpi_write_binary(&d, sk, X25519_KEY_SIZE) != 0) {
+        mbedtls_ecp_point_free(&Q);
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
+        return false;
+    }
+    if (mbedtls_mpi_write_binary(&Q.X, pk, X25519_KEY_SIZE) != 0) {
+        mbedtls_ecp_point_free(&Q);
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
+        return false;
+    }
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_group_free(&grp);
     return true;
 }
 
 static bool x25519Shared(const uint8_t* my_sk, const uint8_t* peer_pk, uint8_t* out) {
-    mbedtls_ecdh_context ctx;
-    mbedtls_ecdh_init(&ctx);
-    if (mbedtls_ecdh_setup(&ctx, MBEDTLS_ECP_DP_CURVE25519) != 0) {
-        mbedtls_ecdh_free(&ctx);
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_group_init(&grp);
+    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519) != 0) {
+        mbedtls_ecp_group_free(&grp);
         return false;
     }
-    if (mbedtls_mpi_read_binary(&ctx.d, my_sk, X25519_KEY_SIZE) != 0) {
-        mbedtls_ecdh_free(&ctx);
+    mbedtls_mpi d;
+    mbedtls_mpi_init(&d);
+    if (mbedtls_mpi_read_binary(&d, my_sk, X25519_KEY_SIZE) != 0) {
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
         return false;
     }
-    if (mbedtls_ecdh_read_public(&ctx, peer_pk, X25519_KEY_SIZE) != 0) {
-        mbedtls_ecdh_free(&ctx);
+    mbedtls_ecp_point Q;
+    mbedtls_ecp_point_init(&Q);
+    if (mbedtls_mpi_read_binary(&Q.X, peer_pk, X25519_KEY_SIZE) != 0) {
+        mbedtls_ecp_point_free(&Q);
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
         return false;
     }
-    unsigned char buf[32];
-    size_t olen;
-    if (mbedtls_ecdh_calc_secret(&ctx, &olen, buf, sizeof(buf), esp_random, NULL) != 0) {
-        mbedtls_ecdh_free(&ctx);
+    mbedtls_mpi_lset(&Q.Y, 1);
+    mbedtls_mpi_lset(&Q.Z, 1);
+    mbedtls_ecp_point S;
+    mbedtls_ecp_point_init(&S);
+    if (mbedtls_ecp_mul(&grp, &S, &d, &Q, x25519_rng, NULL) != 0) {
+        mbedtls_ecp_point_free(&S);
+        mbedtls_ecp_point_free(&Q);
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
         return false;
     }
-    memcpy(out, buf, 32);
-    mbedtls_ecdh_free(&ctx);
+    if (mbedtls_mpi_write_binary(&S.X, out, 32) != 0) {
+        mbedtls_ecp_point_free(&S);
+        mbedtls_ecp_point_free(&Q);
+        mbedtls_mpi_free(&d);
+        mbedtls_ecp_group_free(&grp);
+        return false;
+    }
+    mbedtls_ecp_point_free(&S);
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_group_free(&grp);
     return true;
 }
 
@@ -516,7 +572,6 @@ static void x25519EnsureKeypair() {
     Serial.println("[X25519] ready");
 }
 
-// AES-GCM con chiave X25519
 static bool x25519Encrypt(const uint8_t* shared_key,
                           const uint8_t* aad, size_t aadLen,
                           const uint8_t* plaintext, uint16_t len,
@@ -765,6 +820,13 @@ static void peersSweep() {
     unsigned long t = nowMs();
     for (int i = 0; i < MAX_PEERS; i++) {
         if (peers[i].state == PEER_NONE) continue;
+
+        // Reset lastSeenProto se inattivo da troppo (peer potrebbe essere su altro proto)
+        if ((t - peers[i].last_activity) > LASTSEEN_RESET_MS
+            && peers[i].lastSeenProto != PROTO_LORA) {
+            peers[i].lastSeenProto = PROTO_LORA;
+        }
+
         if (peers[i].state == PEER_ESTABLISHED && (t - peers[i].last_activity > 30UL * 60UL * 1000UL)) {
             memset(&peers[i], 0, sizeof(PeerSession));
         }
@@ -815,7 +877,6 @@ static OutgoingMessage* outgoingAlloc() {
 
 static void outgoingFree(OutgoingMessage* o) { if (o) memset(o, 0, sizeof(OutgoingMessage)); }
 
-// Forward
 static void transmitFrame(GPacket& p);
 static bool enqueueTx(const GPacket& p);
 
@@ -913,6 +974,11 @@ static void rxSlotsSweep() {
             memset(&rxSlots[i], 0, sizeof(IncomingMessage));
 }
 
+static bool protoReady(ProtoType p);
+static ProtoType selectProtoFor(uint32_t target);
+static void sendVia(ProtoType proto, const GPacket& p);
+
+// ACK via stesso proto d'ingresso (fix handshake via BLE)
 static void sendAckBitmap(uint32_t target, uint16_t session, uint8_t mask) {
     if (target == BROADCAST_ID) return;
     uint8_t payload[4];
@@ -924,7 +990,10 @@ static void sendAckBitmap(uint32_t target, uint16_t session, uint8_t mask) {
     buildHeader(p, MSG_ACK, target, 1, 0, 4, 0,
                 ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
     memcpy(p.payload, payload, 4);
-    transmitFrame(p);
+    ProtoType useProto = (ProtoType)g_lastRxProto;
+    if (!protoReady(useProto)) useProto = selectProtoFor(target);
+    p.originProto = (uint8_t)useProto;
+    sendVia(useProto, p);
 }
 
 static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len);
@@ -990,8 +1059,6 @@ static void radioTask(void*) {
             if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION)
                 handleReceivedPacketFromProto(p, PROTO_LORA);
             else crc_error_count++;
-        } else if (st == RADIOLIB_ERR_CROSS_MISMATCH) {
-            // unreachable, silence
         } else if (st == RADIOLIB_ERR_CRC_MISMATCH) {
             crc_error_count++;
         }
@@ -1010,14 +1077,12 @@ static IPAddress wifiBroadcastFor(IPAddress ip, IPAddress mask) {
 
 static void wifiSend(const GPacket& p) {
     if (!g_wifiReady) return;
-    // STA broadcast
     if (WiFi.status() == WL_CONNECTED) {
         IPAddress b = wifiBroadcastFor(WiFi.localIP(), WiFi.subnetMask());
         g_udp.beginPacket(b, UDP_DATA_PORT);
         g_udp.write((const uint8_t*)&p, sizeof(GPacket));
         g_udp.endPacket();
     }
-    // AP broadcast (client collegati al nostro AP)
     if (WiFi.getMode() & WIFI_MODE_AP) {
         IPAddress b = wifiBroadcastFor(WiFi.softAPIP(), IPAddress(255,255,255,0));
         g_udp.beginPacket(b, UDP_DATA_PORT);
@@ -1038,17 +1103,40 @@ static void wifiDataTick() {
     }
 }
 
-static void wifiSetupTask(void*) {
-    // Modalità duale: STA verso rete esterna, AP locale per Web UI
-    WiFi.mode(WIFI_AP_STA);
+static void wifiSetupSync() {
+    WiFi.persistent(false);
     WiFi.setSleep(false);
+    WiFi.mode(WIFI_AP);
+    delay(200);
 
-    // Discovery: cerca reti QORLYN-* e unisciti a quella con miglior segnale
+    char mySSID[24];
+    sprintf(mySSID, "%s%08X", WIFI_SSID_PREFIX, myID);
+    WiFi.softAP(mySSID, WIFI_PASSWORD);
+    delay(500);
+
+    Serial.printf("[WiFi] AP %s -> %s\n", mySSID, WiFi.softAPIP().toString().c_str());
+
+    g_udp.begin(UDP_DATA_PORT);
+    g_wifiReady = true;
+    Serial.printf("[WiFi] UDP data port %d ready\n", UDP_DATA_PORT);
+}
+
+// Retry periodico STA (ogni 60s) — non blocca
+static unsigned long g_lastStaTry = 0;
+static void wifiStaTry() {
+    return; //disabilitato per ora: causava stack overflow nel loopTask
+    if (!g_wifiReady) return;
+    if (WiFi.status() == WL_CONNECTED) return;
+    if (nowMs() - g_lastStaTry < STA_RETRY_INTERVAL_MS) return;
+    g_lastStaTry = nowMs();
+
     char mySSID[24];
     sprintf(mySSID, "%s%08X", WIFI_SSID_PREFIX, myID);
 
-    Serial.println("[WiFi] scan...");
+    Serial.println("[WiFi] STA retry scan...");
     int n = WiFi.scanNetworks();
+    if (n <= 0) { Serial.println("[WiFi] scan fail"); return; }
+
     String bestSSID;
     int bestRSSI = -1000;
     for (int i = 0; i < n; i++) {
@@ -1062,32 +1150,18 @@ static void wifiSetupTask(void*) {
     }
     WiFi.scanDelete();
 
-    if (bestSSID.length() > 0) {
-        Serial.printf("[WiFi] join %s (rssi=%d)\n", bestSSID.c_str(), bestRSSI);
-        WiFi.begin(bestSSID.c_str(), WIFI_PASSWORD);
-        unsigned long start = nowMs();
-        while (WiFi.status() != WL_CONNECTED && (nowMs() - start) < WIFI_STA_TIMEOUT_MS) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[WiFi] STA OK ip=%s\n", WiFi.localIP().toString().c_str());
-        } else {
-            Serial.println("[WiFi] STA fail, solo AP");
-            WiFi.disconnect();
-        }
-    } else {
-        Serial.println("[WiFi] nessuna QORLYN trovata, solo AP");
+    if (bestSSID.length() == 0) {
+        Serial.println("[WiFi] nessuna QORLYN trovata");
+        return;
     }
 
-    // AP sempre attivo per Web UI locale
-    WiFi.softAP(mySSID, WIFI_PASSWORD);
-    Serial.printf("[WiFi] AP %s -> %s\n", mySSID, WiFi.softAPIP().toString().c_str());
-
-    g_udp.begin(UDP_DATA_PORT);
-    g_wifiReady = true;
-    Serial.printf("[WiFi] UDP data port %d ready\n", UDP_DATA_PORT);
-
-    vTaskDelete(NULL);
+    Serial.printf("[WiFi] STA retry join %s (rssi=%d)\n", bestSSID.c_str(), bestRSSI);
+    if (WiFi.getMode() != WIFI_AP_STA) {
+        WiFi.mode(WIFI_AP_STA);
+        delay(200);
+    }
+    WiFi.begin(bestSSID.c_str(), WIFI_PASSWORD);
+    // Non blocca: la connessione avverrà in background
 }
 
 // ============================================================================
@@ -1109,16 +1183,15 @@ static void bleHandleIncoming(const uint8_t* data, size_t len);
 
 class QorlynBleRxCB : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* c) override {
-        std::string v = c->getValue();
+        String v = c->getValue();
         if (v.length() < 1) return;
-        bleHandleIncoming((const uint8_t*)v.data(), v.length());
+        bleHandleIncoming((const uint8_t*)v.c_str(), v.length());
     }
 };
 
 static void bleSendPeripheral(const uint8_t* data, size_t len) {
-    if (!g_bleReady_check()) return;
+    if (!g_btReady) return;
     if (!g_bleCentralConnected || !g_bleTxChar) return;
-    // Chunking se len > BLE_MTU_PAYLOAD
     size_t off = 0;
     while (off < len) {
         size_t chunk = len - off;
@@ -1130,9 +1203,6 @@ static void bleSendPeripheral(const uint8_t* data, size_t len) {
     }
 }
 
-static bool g_bleReady_check() { return g_btReady; }
-
-// Ble central: notifiche dai peripheral connessi
 static void bleCentralNotifyCB(BLERemoteCharacteristic* c, uint8_t* data, size_t len, bool isNotify) {
     (void)c; (void)isNotify;
     bleHandleIncoming(data, len);
@@ -1142,35 +1212,37 @@ static void bleCentralScanTask(void*) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(BLE_SCAN_INTERVAL_MS));
         if (!g_btReady) continue;
+        if (!g_bleScanEnabled) continue;
 
-        // Conta link attivi
         int active = 0;
         for (int i = 0; i < BLE_MAX_CENTRALS; i++) if (g_bleCentrals[i].active) active++;
         if (active >= BLE_MAX_CENTRALS) continue;
 
         BLEScan* scan = BLEDevice::getScan();
         scan->setActiveScan(true);
-        BLEScanResults res = scan->start(3, false);
+        BLEScanResults* res = scan->start(3, false);
+        if (!res) continue;
 
-        for (int i = 0; i < res.getCount(); i++) {
-            BLEAdvertisedDevice dev = res.getDevice(i);
+        for (int i = 0; i < res->getCount(); i++) {
+            BLEAdvertisedDevice dev = res->getDevice(i);
             if (!dev.haveName()) continue;
             String name = dev.getName().c_str();
             if (!name.startsWith(BLE_DEVICE_PREFIX)) continue;
 
-            // Estrai ID dal nome "QORLYN-XXXXXXXX"
             int dash = name.lastIndexOf('-');
             if (dash < 0) continue;
             uint32_t peerID = strtoul(name.substring(dash + 1).c_str(), nullptr, 16);
             if (peerID == 0 || peerID == myID) continue;
 
-            // Già connesso?
+            // Elezione BLE: l'ID piu' alto si connette come central
+            // (basta che solo uno dei due lati tenti la connessione)
+            if (peerID > myID) continue;
+
             bool dup = false;
             for (int j = 0; j < BLE_MAX_CENTRALS; j++)
                 if (g_bleCentrals[j].active && g_bleCentrals[j].peerID == peerID) { dup = true; break; }
             if (dup) continue;
 
-            // Trova slot libero
             int slot = -1;
             for (int j = 0; j < BLE_MAX_CENTRALS; j++)
                 if (!g_bleCentrals[j].active) { slot = j; break; }
@@ -1202,7 +1274,8 @@ static void bleCentralScanTask(void*) {
 }
 
 static void bleSetup() {
-    BLEDevice::init(BLE_DEVICE_NAME_UNIQUE);  // vedi macro sotto
+    snprintf(g_bleName, sizeof(g_bleName), "%s-%08X", BLE_DEVICE_PREFIX, myID);
+    BLEDevice::init(g_bleName);
     BLEDevice::setMTU(517);
     g_bleServer = BLEDevice::createServer();
     g_bleServer->setCallbacks(new QorlynBleServerCB());
@@ -1231,25 +1304,22 @@ static void bleSetup() {
 }
 
 // ============================================================================
-// 17. BLE chunking (peripheral + central in ingresso)
+// 17. BLE chunking
 // ============================================================================
-// I pacchetti BLE possono arrivare chunked. Buffer di riassemblaggio.
 static uint8_t  s_bleRxBuf[sizeof(GPacket) * 2];
 static size_t   s_bleRxLen = 0;
 
 static void bleHandleIncoming(const uint8_t* data, size_t len) {
-    // Strategia semplice: se len == sizeof(GPacket), è un pacchetto completo
-    // Altrimenti accumula in s_bleRxBuf fino a sizeof(GPacket).
     if (len == sizeof(GPacket)) {
         GPacket p;
         memcpy(&p, data, sizeof(GPacket));
         if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION
             && p.senderID != myID) {
-            handleReceivedPacketFromProto(p, PROTO_BT);
+            // Non processare qui: queue al mainTask (stack 16 KB)
+            xQueueSend(bleRxQueue, &p, 0);
         }
         return;
     }
-    // Chunked (raro): accumula
     if (s_bleRxLen + len <= sizeof(s_bleRxBuf)) {
         memcpy(s_bleRxBuf + s_bleRxLen, data, len);
         s_bleRxLen += len;
@@ -1259,28 +1329,24 @@ static void bleHandleIncoming(const uint8_t* data, size_t len) {
             s_bleRxLen = 0;
             if (p.stx == STX_BYTE && p.etx == ETX_BYTE && p.version == G_VERSION
                 && p.senderID != myID) {
-                handleReceivedPacketFromProto(p, PROTO_BT);
+                xQueueSend(bleRxQueue, &p, 0);
             }
         }
     } else {
-        s_bleRxLen = 0;  // overflow, resetta
+        s_bleRxLen = 0;
     }
 }
 
 static void bleSend(const GPacket& p) {
     if (!g_btReady) return;
-    // Verso il peripheral (central connesso a noi)
     if (g_bleCentralConnected && g_bleTxChar) {
         bleSendPeripheral((const uint8_t*)&p, sizeof(GPacket));
     }
-    // Verso central (noi connessi come central a un peripheral)
     for (int i = 0; i < BLE_MAX_CENTRALS; i++) {
         if (!g_bleCentrals[i].active) continue;
-        // Preferisci il link il cui peerID == target del pacchetto
         if (p.targetID != BROADCAST_ID && g_bleCentrals[i].peerID != p.targetID) continue;
         BLERemoteCharacteristic* rxr = g_bleCentrals[i].rxChar;
         if (!rxr) continue;
-        // Scrittura chunked
         size_t off = 0;
         while (off < sizeof(GPacket)) {
             size_t chunk = sizeof(GPacket) - off;
@@ -1289,7 +1355,7 @@ static void bleSend(const GPacket& p) {
             off += chunk;
         }
         g_bleCentrals[i].lastSeen = nowMs();
-        if (p.targetID != BROADCAST_ID) return;  // inviato al target specifico
+        if (p.targetID != BROADCAST_ID) return;
     }
 }
 
@@ -1306,7 +1372,6 @@ static bool protoReady(ProtoType p) {
 }
 
 static ProtoType selectProtoFor(uint32_t target) {
-    // Preferenza: proto su cui abbiamo visto il peer l'ultima volta
     if (target != BROADCAST_ID) {
         PeerSession* ps = peerFind(target);
         if (ps && ps->state != PEER_NONE) {
@@ -1314,11 +1379,10 @@ static ProtoType selectProtoFor(uint32_t target) {
             if (protoReady(pref)) return pref;
         }
     }
-    // Priorità fissa, mai un proto non ready
     if (g_loraReady) return PROTO_LORA;
     if (g_wifiReady) return PROTO_WIFI;
     if (protoReady(PROTO_BT)) return PROTO_BT;
-    return PROTO_LORA;  // fallback assoluto (verrà loggato)
+    return PROTO_LORA;
 }
 
 static void sendVia(ProtoType proto, const GPacket& p) {
@@ -1330,6 +1394,21 @@ static void sendVia(ProtoType proto, const GPacket& p) {
 }
 
 static void transmitFrame(GPacket& p) {
+    // Handshake (PK e CT): broadcast su tutti i proto attivi per affidabilita'.
+    // Il dedup sul ricevente scartera' i duplicati.
+    if (p.msgType == MSG_KYBER_PUBKEY || p.msgType == MSG_KYBER_CIPHERTEXT) {
+        bool sent = false;
+        for (uint8_t i = 0; i < 3; i++) {
+            ProtoType pt = (ProtoType)i;
+            if (!protoReady(pt)) continue;
+            GPacket copy = p;
+            copy.originProto = (uint8_t)pt;
+            sendVia(pt, copy);
+            sent = true;
+        }
+        if (!sent) Serial.println("[TX] handshake: nessun proto ready");
+        return;
+    }
     ProtoType useProto = selectProtoFor(p.targetID);
     p.originProto = (uint8_t)useProto;
     if (!protoReady(useProto)) {
@@ -1340,22 +1419,7 @@ static void transmitFrame(GPacket& p) {
 
 // ============================================================================
 // 19. ONION ROUTING (X25519 effimero per-hop)
-// ----------------------------------------------------------------------------
-// Layer (dopo eph_pub):  [next_hop:4][type:1][flags:1][len:2][inner:len]
-//
-// Struttura del pacchetto onion inviato al primo hop:
-//   [eph_pub:32][iv:12][tag:16][ciphertext]
-//   ciphertext = AES-GCM(K = ECDH(sk_eph, pk_H1), layer_1_plaintext)
-//
-// Ogni hop H(i) riceve [eph_pub][iv][tag][ct]. Calcola K = ECDH(sk_Hi, eph_pub).
-// Decifra. Se next_hop == 0 è il destinatario, altrimenti forwarda a next_hop
-// con senderID = H(i) (non l'originatore!).
-//
-// Nessun hop vede l'originatore, tranne il primo hop che vede il mittente
-// diretto (perché è lui che ha ricevuto il pacchetto). L'originatore S
-// è visibile solo a H1, non a H2..Hn. Questo è il modello Tor.
 // ============================================================================
-
 static void onionTrackerSweep() {
     unsigned long t = nowMs();
     for (int i = 0; i < ONION_TRACKER_SIZE; i++)
@@ -1395,8 +1459,6 @@ static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
                                    uint8_t* data, uint16_t len,
                                    bool ackReq, uint32_t ackToken);
 
-// Costruisci UN layer per Hi: encrypt ( plaintext ) con K = ECDH(eph_sk, pk_Hi)
-// eph_pub viene prepended al ciphertext.
 static bool onionBuildLayer(const uint8_t* hop_pk,
                             const uint8_t* plaintext, uint16_t ptLen,
                             uint8_t* out, uint16_t& outLen) {
@@ -1407,7 +1469,6 @@ static bool onionBuildLayer(const uint8_t* hop_pk,
     uint8_t K[32];
     if (!x25519Shared(eph_sk, hop_pk, K)) return false;
 
-    // AAD = eph_pub per legare il ciphertext alla chiave effimera
     uint8_t aad[X25519_KEY_SIZE];
     memcpy(aad, eph_pk, X25519_KEY_SIZE);
 
@@ -1432,9 +1493,9 @@ static bool onionSend(GMessageType finalType, uint32_t target,
     for (uint8_t i = 0; i < nHops; i++) path[i] = hops[i];
     path[nHops] = target;
 
-    // Verifica che ogni hop abbia x25519_pk noto
     for (uint8_t i = 0; i < pathLen; i++) {
         if (path[i] == BROADCAST_ID) return false;
+        if (path[i] == myID) continue;  // siamo noi stessi, skip check
         PeerSession* ps = peerFind(path[i]);
         if (!ps || !ps->has_x25519_pk) {
             Serial.printf("[ONION] no x25519 pk for %08X\n", path[i]);
@@ -1447,40 +1508,48 @@ static bool onionSend(GMessageType finalType, uint32_t target,
 
     uint32_t ackToken = ackReq ? onionTrackerAdd(target) : 0;
 
-    // Layer innermost (per il destinatario finale)
-    // plaintext: [next=0][type][flags][len][origin_id][token][payload]
     {
         uint16_t i = 0;
         uint16_t innerLen = ONION_INNER_HDR + dataLen;
         uint8_t p0[ONION_BUF];
-        p0[i++] = 0; p0[i++] = 0; p0[i++] = 0; p0[i++] = 0;  // next_hop = 0
+        p0[i++] = 0; p0[i++] = 0; p0[i++] = 0; p0[i++] = 0;
         p0[i++] = (uint8_t)finalType;
         p0[i++] = ackReq ? ONION_FLAG_ACK_REQ : 0;
         p0[i++] = (innerLen >> 8) & 0xFF;
         p0[i++] = innerLen & 0xFF;
-        // origin_id = S (myID)
         p0[i++] = (myID >> 24) & 0xFF;
         p0[i++] = (myID >> 16) & 0xFF;
         p0[i++] = (myID >>  8) & 0xFF;
         p0[i++] = (myID      ) & 0xFF;
-        // token (0 se non richiesto)
         p0[i++] = (ackToken >> 24) & 0xFF;
         p0[i++] = (ackToken >> 16) & 0xFF;
         p0[i++] = (ackToken >>  8) & 0xFF;
         p0[i++] = (ackToken      ) & 0xFF;
         if (dataLen) { memcpy(p0 + i, data, dataLen); i += dataLen; }
 
-        PeerSession* tps = peerFind(target);
+        const uint8_t* target_pk;
+        if (target == myID) {
+            target_pk = g_x25519_pk;
+        } else {
+            PeerSession* tps = peerFind(target);
+            if (!tps) return false;
+            target_pk = tps->x25519_pk;
+        }
         uint16_t curLen = 0;
-        if (!onionBuildLayer(tps->x25519_pk, p0, i, s_onionA, curLen)) return false;
-        // ora s_onionA contiene il layer per il target
+        if (!onionBuildLayer(target_pk, p0, i, s_onionA, curLen)) return false;
         uint16_t bufLen = curLen;
         uint8_t* cur = s_onionA;
         uint8_t* nxt = s_onionB;
 
-        // Layer intermedi: dal più interno (nHops-1) al più esterno (0)
         for (int k = (int)nHops - 1; k >= 0; k--) {
-            PeerSession* ps = peerFind(path[k]);
+            const uint8_t* hop_pk;
+            if (path[k] == myID) {
+                hop_pk = g_x25519_pk;
+            } else {
+                PeerSession* ps = peerFind(path[k]);
+                if (!ps) return false;
+                hop_pk = ps->x25519_pk;
+            }
             uint32_t nextHop = path[k + 1];
 
             uint8_t plain[ONION_BUF];
@@ -1496,8 +1565,7 @@ static bool onionSend(GMessageType finalType, uint32_t target,
             memcpy(plain + j, cur, bufLen); j += bufLen;
 
             uint16_t outLen = 0;
-            if (!onionBuildLayer(ps->x25519_pk, plain, j, nxt, outLen)) return false;
-            // swap cur/nxt
+            if (!onionBuildLayer(hop_pk, plain, j, nxt, outLen)) return false;
             uint8_t* t = cur; cur = nxt; nxt = t;
             bufLen = outLen;
         }
@@ -1505,7 +1573,6 @@ static bool onionSend(GMessageType finalType, uint32_t target,
         Serial.printf("[ONION] send path=%u target=%08X len=%u ack=%d\n",
                       pathLen, target, bufLen, ackReq ? 1 : 0);
 
-        // Invia cur al primo hop (path[0] se nHops>0, altrimenti target)
         uint32_t firstHop = (nHops > 0) ? path[0] : target;
         outgoingStart(MSG_ONION, firstHop, cur, bufLen,
                       FLAG_RELAY_OK | FLAG_NO_RETRY, false);
@@ -1543,7 +1610,6 @@ static void handleOnionLayer(uint32_t fromHop, uint8_t* data, uint16_t len) {
     if (innerLen > plainLen - ONION_LAYER_HDR) return;
 
     if (nextHop == 0) {
-        // Siamo il destinatario finale
         if (innerLen < ONION_INNER_HDR) return;
         uint32_t origSender = ((uint32_t)inner[0] << 24) | ((uint32_t)inner[1] << 16)
                             | ((uint32_t)inner[2] <<  8) |  (uint32_t)inner[3];
@@ -1558,21 +1624,11 @@ static void handleOnionLayer(uint32_t fromHop, uint8_t* data, uint16_t len) {
         dispatchOnionDelivered(origSender, nextType, userData, userLen, ackReq, token);
         Serial.printf("[ONION] delivered from %08X len=%u\n", origSender, userLen);
     } else {
-        // Relay: forward a nextHop, senderID = myID (non l'originatore!)
         if (nextType != MSG_ONION) return;
 
-        GPacket fwd;
-        buildHeader(fwd, MSG_ONION, nextHop, 1, 0, innerLen,
-                    FLAG_RELAY_OK | FLAG_NO_RETRY,
-                    ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
-        // senderID rimane myID (buildHeader lo imposta), NON l'originatore
-        fwd.flags &= ~FLAG_ACK_REQ;
-        memcpy(fwd.payload, inner, innerLen);
-        ProtoType src = (ProtoType)g_lastRxProto;
-        fwd.originProto = (uint8_t)src;
-        sendVia(src, fwd);
-        Serial.printf("[ONION] relay -> %08X via %s (%u B)\n",
-                      nextHop, protoName(src), innerLen);
+        outgoingStart(MSG_ONION, nextHop, inner, innerLen,
+                      FLAG_RELAY_OK | FLAG_NO_RETRY, false);
+        Serial.printf("[ONION] relay -> %08X (%u B)\n", nextHop, innerLen);
     }
 }
 
@@ -1582,7 +1638,6 @@ static void handleOnionLayer(uint32_t fromHop, uint8_t* data, uint16_t len) {
 static void dispatchOnionDelivered(uint32_t origSender, uint8_t type,
                                    uint8_t* data, uint16_t len,
                                    bool ackReq, uint32_t ackToken) {
-    // Se ACK richiesto: cifra token con X25519 effimero e invia a origSender
     if (ackReq && g_x25519_ready) {
         PeerSession* sPeer = peerFind(origSender);
         if (sPeer && sPeer->has_x25519_pk) {
@@ -1665,12 +1720,25 @@ static void handleOnionAckPacket(GPacket& frame, uint8_t* data, uint16_t len) {
 // ============================================================================
 // 21. KEY EXCHANGE + HEARTBEAT X25519
 // ============================================================================
+static void sendMyX25519To(uint32_t peerID) {
+    x25519EnsureKeypair();
+    if (!g_x25519_ready) return;
+    GPacket hb;
+    buildHeader(hb, MSG_HEARTBEAT, peerID, 1, 0, X25519_KEY_SIZE,
+                FLAG_RELAY_OK,
+                ++g_sessionCounter, g_sessionCounter++, DEFAULT_TTL);
+    memcpy(hb.payload, g_x25519_pk, X25519_KEY_SIZE);
+    transmitFrame(hb);
+    Serial.printf("[X25519] sent pk to %08X\n", peerID);
+}
+
 static void handleHeartbeatPayload(const uint8_t* data, uint16_t len, uint32_t sender) {
     if (len < X25519_KEY_SIZE) return;
     PeerSession* ps = peerFind(sender);
     if (!ps || ps->state == PEER_NONE) return;
     memcpy(ps->x25519_pk, data, X25519_KEY_SIZE);
     ps->has_x25519_pk = true;
+    Serial.printf("[X25519] got pk from %08X\n", sender);
 }
 
 static void handleKeyExchangePubKey(const uint8_t* data, uint16_t len, uint32_t remoteID) {
@@ -1688,6 +1756,7 @@ static void handleKeyExchangePubKey(const uint8_t* data, uint16_t len, uint32_t 
     }
     ps->last_request_time = t;
     ps->last_activity = t;
+    ps->lastSeenProto = g_lastRxProto;
 
     PendingPeer* pp = pendingFind(remoteID);
     if (!pp) pp = pendingAlloc();
@@ -1707,7 +1776,6 @@ static void handleKeyExchangePubKey(const uint8_t* data, uint16_t len, uint32_t 
     ps->state = PEER_PENDING_IN;
 
     if (accept) {
-        // encapsula + rispondi
         static uint8_t ct[KYBER_CT_SIZE];
         uint8_t shared[32];
         pqc_kyber512_encapsulate(ct, shared, pp->pk);
@@ -1715,10 +1783,12 @@ static void handleKeyExchangePubKey(const uint8_t* data, uint16_t len, uint32_t 
         ps->state = PEER_ESTABLISHED;
         ps->tx_seq = 1;
         ps->last_rx_seq = 0;
+        ps->lastSeenProto = g_lastRxProto;
         pendingFree(remoteID);
         outgoingStart(MSG_KYBER_CIPHERTEXT, remoteID, ct, KYBER_CT_SIZE, FLAG_RELAY_OK, true);
         Serial.printf("[KYBER] auto-accept %08X\n", remoteID);
         updateUI("SECURE", "auto");
+        sendMyX25519To(remoteID);
     } else {
         Serial.printf("[KYBER] PENDING %08X\n", remoteID);
         updateUI("PENDING", "richiesta peer");
@@ -1738,16 +1808,33 @@ static void handleKeyExchangeCiphertext(const uint8_t* data, uint16_t len, uint3
     ps->tx_seq = 1;
     ps->last_rx_seq = 0;
     ps->last_activity = nowMs();
+    ps->lastSeenProto = g_lastRxProto;
     Serial.printf("[KYBER] ESTABLISHED with %08X\n", remoteID);
     updateUI("SECURE", "sessione attiva");
+    sendMyX25519To(remoteID);
 }
 
 static bool initiateHandshake(uint32_t target) {
-    if (target == BROADCAST_ID || target == myID) return false;
-    if (isBlocked(target)) return false;
+    if (target == BROADCAST_ID || target == myID) {
+        Serial.println(F("[KYBER] target non valido"));
+        return false;
+    }
+    if (isBlocked(target)) {
+        Serial.printf("[KYBER] target %08X bloccato\n", target);
+        return false;
+    }
 
     PeerSession* ps = peerFind(target);
-    if (ps && (ps->state == PEER_ESTABLISHED || ps->state == PEER_PENDING_OUT)) return false;
+    if (ps) {
+        if (ps->state == PEER_ESTABLISHED) {
+            Serial.printf("[KYBER] %08X gia' established, skip\n", target);
+            return false;
+        }
+        if (ps->state == PEER_PENDING_OUT) {
+            Serial.printf("[KYBER] %08X gia' pending-out, skip\n", target);
+            return false;
+        }
+    }
     if (!ps) {
         ps = peerGetOrCreate(target);
         if (!ps) return false;
@@ -1782,6 +1869,7 @@ static bool peerAcceptPending(uint32_t peerID) {
     outgoingStart(MSG_KYBER_CIPHERTEXT, peerID, ct, KYBER_CT_SIZE, FLAG_RELAY_OK, true);
     Serial.printf("[KYBER] ACCEPT %08X\n", peerID);
     updateUI("ACCEPT", "peer OK");
+    sendMyX25519To(peerID);
     return true;
 }
 
@@ -1826,15 +1914,9 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
     }
     if (type == MSG_NACK) return;
 
-    // Heartbeat: payload può contenere x25519_pk (32 byte)
     if (type == MSG_HEARTBEAT) {
         if (len >= X25519_KEY_SIZE) handleHeartbeatPayload(data, len, sender);
         return;
-    }
-
-    if (!(frame.flags & FLAG_ENCRYPTED) && (frame.flags & FLAG_PLAINTEXT_WARN)
-        && frame.targetID != BROADCAST_ID) {
-        updateUI("PLAINTEXT!", "msg in chiaro");
     }
 
     const uint8_t* plain = data;
@@ -1865,6 +1947,12 @@ static void processFinalMessage(GPacket& frame, uint8_t* data, uint16_t len) {
             break;
         }
     }
+
+    // Warning plaintext: loggato solo su seriale, NON sovrascrive l'OLED
+    if (!(frame.flags & FLAG_ENCRYPTED) && (frame.flags & FLAG_PLAINTEXT_WARN)
+        && frame.targetID != BROADCAST_ID) {
+        Serial.printf("[RX] *** PLAINTEXT da %08X ***\n", sender);
+    }
 }
 
 // ============================================================================
@@ -1875,7 +1963,6 @@ static void handleReceivedPacketFromProto(GPacket& p, ProtoType src) {
 
     if (p.targetID != BROADCAST_ID && p.senderID != myID && isBlocked(p.senderID)) return;
 
-    // Aggiorna lastSeenProto SOLO se pacchetto diretto
     if (p.senderID != myID && (ProtoType)p.originProto == src) {
         PeerSession* ps = peerFind(p.senderID);
         if (ps && ps->state != PEER_NONE) ps->lastSeenProto = (uint8_t)src;
@@ -1890,14 +1977,16 @@ static void handleReceivedPacketFromProto(GPacket& p, ProtoType src) {
 
     if (!forMe) foreign_packets_count++;
 
-    // Relay: pacchetti normali (non onion, non ACK, non handshake)
-    // Il bridging cross-proto è permesso: se il target non è raggiungibile
-    // via src, scegliamo un proto diverso con selectProtoFor.
+    // Log utile per debug: pacchetti per me (non ACK/HB) da che proto arrivano
+    if (forMe && !isBroadcast && p.msgType != MSG_ACK && p.msgType != MSG_HEARTBEAT) {
+        Serial.printf("[RX] %s from %08X type=0x%02X frame=%u/%u\n",
+                      protoName(src), p.senderID, p.msgType,
+                      (unsigned)p.frameIdx + 1, (unsigned)p.totalFrames);
+    }
+
     if (relayable && p.targetID != myID && p.msgType != MSG_ONION) {
         GPacket r = p;
         r.ttl--;
-        // Verifica che il target sia raggiungibile via proto src,
-        // altrimenti bridging verso un proto alternativo
         ProtoType outProto = src;
         if (p.targetID != BROADCAST_ID) {
             ProtoType preferred = selectProtoFor(p.targetID);
@@ -1956,14 +2045,12 @@ static void sendSecureOrPlain(GMessageType type, uint32_t target,
 // ============================================================================
 static unsigned long lastHeartbeat = 0;
 static void heartbeatTick() {
-    if (nowMs() - lastHeartbeat < 60000) return;
+    if (nowMs() - lastHeartbeat < HEARTBEAT_INTERVAL_MS) return;
     lastHeartbeat = nowMs();
     x25519EnsureKeypair();
 
-    // Heartbeat con payload x25519_pk (32 byte) su LoRa broadcast
     outgoingStart(MSG_HEARTBEAT, BROADCAST_ID, g_x25519_pk, X25519_KEY_SIZE, FLAG_RELAY_OK);
 
-    // Duplicato via WiFi/BT per far apprendere la pk a peer su altri mezzi
     GPacket hb;
     buildHeader(hb, MSG_HEARTBEAT, BROADCAST_ID, 1, 0, X25519_KEY_SIZE,
                 FLAG_RELAY_OK | FLAG_BROADCAST,
@@ -2022,7 +2109,6 @@ static String pageMain() {
     h += " | BLE:";  h += (g_btReady && g_bleCentralConnected) ? "conn" : (g_btReady ? "adv" : "off");
     h += " | Policy: "; h += policyName(g_policy); h += "</div>";
 
-    // Pending
     h += "<div class='card'><h3>PENDING</h3>";
     bool any = false;
     for (int i = 0; i < MAX_PEERS; i++) {
@@ -2045,7 +2131,6 @@ static String pageMain() {
     if (!any) h += "<div class='hint'>nessuna</div>";
     h += "</div>";
 
-    // Established
     h += "<div class='card'><h3>ESTABLISHED</h3>";
     any = false;
     for (int i = 0; i < MAX_PEERS; i++) {
@@ -2063,7 +2148,6 @@ static String pageMain() {
     if (!any) h += "<div class='hint'>nessuna</div>";
     h += "</div>";
 
-    // Blocked
     h += "<div class='card'><h3>BLOCKED</h3>";
     for (uint8_t i = 0; i < g_blocklist_count; i++) {
         char b[16]; sprintf(b, "%08X", g_blocklist[i]);
@@ -2073,7 +2157,6 @@ static String pageMain() {
     if (!g_blocklist_count) h += "<div class='hint'>nessuno</div>";
     h += "</div>";
 
-    // Policy
     h += "<div class='card'><h3>POLICY</h3>";
     const char* pols[] = {"auto","manual","whitelist","hybrid"};
     for (int i = 0; i < 4; i++) {
@@ -2083,7 +2166,6 @@ static String pageMain() {
     }
     h += "</div>";
 
-    // Whitelist
     h += "<div class='card'><h3>WHITELIST</h3>";
     for (uint8_t i = 0; i < g_whitelist_count; i++) {
         char b[16]; sprintf(b, "%08X", g_whitelist[i]);
@@ -2093,7 +2175,6 @@ static String pageMain() {
     h += "<div class='row'><input type='text' id='wlid' placeholder='ID hex' style='width:auto;flex:1'>";
     h += "<button class='msg' onclick=\"wl()\">aggiungi</button></div></div>";
 
-    // Send
     h += "<div class='card'><h3>INVIA</h3>";
     h += "<input type='text' id='t' placeholder='Target ID' value='FFFFFFFF'>";
     h += "<input type='text' id='hops' placeholder='Onion hops (hex comma sep.)' value=''>";
@@ -2224,7 +2305,10 @@ static void setupWeb() {
                 req->send(409, "text/plain", "PLAINTEXT_FALLBACK"); return;
             }
         }
-        if (type == "SOS") sendSecureOrPlain(MSG_SOS_MEDIC, target, nullptr, 0);
+        if (type == "SOS") {
+            static const uint8_t empty = 0;
+            sendSecureOrPlain(MSG_SOS_MEDIC, target, &empty, 0);
+        }
         else if (type == "CHAT") {
             if (msg.length() > MAX_MESSAGE_BYTES) { req->send(413,"text/plain","msg long"); return; }
             sendSecureOrPlain(MSG_CHAT, target, (const uint8_t*)msg.c_str(), msg.length());
@@ -2239,59 +2323,236 @@ static void setupWeb() {
 // ============================================================================
 // 27. SERIAL
 // ============================================================================
+static char   s_cmdBuf[192];
+static size_t s_cmdLen = 0;
+
+static bool parseHex32(const char* s, uint32_t* out) {
+    if (!s || !*s) return false;
+    char* endp = nullptr;
+    uint32_t v = strtoul(s, &endp, 16);
+    if (endp == s || *endp != 0) return false;
+    *out = v;
+    return true;
+}
+
+static void serialHelp() {
+    Serial.println(F("--- Qorlyn serial commands ---"));
+    Serial.println(F("H <id>            handshake verso id"));
+    Serial.println(F("a / r             accept / reject primo pending"));
+    Serial.println(F("A                 lista pending-in"));
+    Serial.println(F("C <id> <msg>      chat cifrata (o plaintext se no sessione)"));
+    Serial.println(F("S <id>            SOS medico"));
+    Serial.println(F("B <msg>           broadcast chat"));
+    Serial.println(F("O <id> <h1,h2|-> <msg>  onion"));
+    Serial.println(F("M                 toggle policy"));
+    Serial.println(F("p                 lista peer"));
+    Serial.println(F("P                 mostra policy"));
+    Serial.println(F("W                 stato trasporti"));
+    Serial.println(F("i                 info interferenza"));
+    Serial.println(F("F <id>            forget peer"));
+    Serial.println(F("X <id>            block peer"));
+    Serial.println(F("Z                 azzera peers e pending"));
+    Serial.println(F("Y                 toggle BLE central scan"));
+    Serial.println(F("R                 re-init radio LoRa"));
+    Serial.println(F("h                 hello broadcast"));
+    Serial.println(F("k / x             kyber / x25519 keypair"));
+    Serial.println(F("?                 mostra questo aiuto"));
+}
+
+static void serialProcessLine(const char* line) {
+    while (*line == ' ' || *line == '\t') line++;
+    if (!*line) return;
+    char cmd = line[0];
+    const char* a1 = line + 1;
+    while (*a1 == ' ' || *a1 == '\t') a1++;
+
+    switch (cmd) {
+        case 'H': {
+            uint32_t id;
+            if (!parseHex32(a1, &id)) { Serial.println(F("uso: H <id_hex>")); return; }
+            initiateHandshake(id);
+            break;
+        }
+        case 'a': {
+            bool any = false;
+            for (int i = 0; i < MAX_PEERS; i++)
+                if (peers[i].state == PEER_PENDING_IN) { peerAcceptPending(peers[i].peerID); any = true; break; }
+            if (!any) Serial.println(F("nessun pending da accettare"));
+            break;
+        }
+        case 'r': {
+            bool any = false;
+            for (int i = 0; i < MAX_PEERS; i++)
+                if (peers[i].state == PEER_PENDING_IN) { peerRejectPending(peers[i].peerID); any = true; break; }
+            if (!any) Serial.println(F("nessun pending da rifiutare"));
+            break;
+        }
+        case 'A': {
+            int idx = 0;
+            for (int i = 0; i < MAX_PEERS; i++)
+                if (peers[i].state == PEER_PENDING_IN)
+                    Serial.printf("[%d] pending-in %08X\n", idx++, peers[i].peerID);
+            if (!idx) Serial.println(F("nessun pending"));
+            break;
+        }
+        case 'C': {
+            char buf[192];
+            strncpy(buf, a1, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+            char* sp = strchr(buf, ' ');
+            if (!sp) { Serial.println(F("uso: C <id_hex> <msg>")); return; }
+            *sp = 0;
+            uint32_t id;
+            if (!parseHex32(buf, &id)) { Serial.println(F("bad id")); return; }
+            const char* msg = sp + 1;
+            sendSecureOrPlain(MSG_CHAT, id, (const uint8_t*)msg, strlen(msg));
+            break;
+        }
+        case 'S': {
+            uint32_t id;
+            if (!parseHex32(a1, &id)) { Serial.println(F("uso: S <id_hex>")); return; }
+            static const uint8_t empty = 0;
+            sendSecureOrPlain(MSG_SOS_MEDIC, id, &empty, 0);
+            break;
+        }
+        case 'B': {
+            sendSecureOrPlain(MSG_CHAT, BROADCAST_ID, (const uint8_t*)a1, strlen(a1));
+            break;
+        }
+        case 'O': {
+            char buf[256];
+            strncpy(buf, a1, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+            char* p1 = strchr(buf, ' ');
+            if (!p1) { Serial.println(F("uso: O <id_hex> <h1,h2|-> <msg>")); return; }
+            *p1 = 0;
+            char* p2 = strchr(p1 + 1, ' ');
+            if (!p2) { Serial.println(F("uso: O <id_hex> <h1,h2|-> <msg>")); return; }
+            *p2 = 0;
+            uint32_t target;
+            if (!parseHex32(buf, &target)) { Serial.println(F("bad target")); return; }
+            uint32_t hops[ONION_MAX_HOPS - 1];
+            uint8_t nHops = 0;
+            if (*(p1 + 1) && strcmp(p1 + 1, "-") != 0) {
+                char* save = nullptr;
+                char* tok = strtok_r(p1 + 1, ",", &save);
+                while (tok && nHops < ONION_MAX_HOPS - 1) {
+                    uint32_t v = strtoul(tok, nullptr, 16);
+                    if (v) hops[nHops++] = v;
+                    tok = strtok_r(nullptr, ",", &save);
+                }
+            }
+            const char* msg = p2 + 1;
+            bool ok = onionSend(MSG_CHAT, target, (const uint8_t*)msg, strlen(msg), hops, nHops, true);
+            Serial.printf("[ONION] %s\n", ok ? "queued" : "FAIL");
+            break;
+        }
+        case 'M': {
+            g_policy = (g_policy + 1) & 0x03;
+            Serial.printf("policy=%s\n", policyName(g_policy));
+            break;
+        }
+        case 'F': {
+            uint32_t id;
+            if (!parseHex32(a1, &id)) { Serial.println(F("uso: F <id_hex>")); return; }
+            peerForget(id);
+            Serial.printf("forget %08X\n", id);
+            break;
+        }
+        case 'X': {
+            uint32_t id;
+            if (!parseHex32(a1, &id)) { Serial.println(F("uso: X <id_hex>")); return; }
+            peerForget(id);
+            addBlocklist(id);
+            Serial.printf("blocked %08X\n", id);
+            break;
+        }
+        case 'Z': {
+            memset(peers, 0, sizeof(peers));
+            memset(g_pending, 0, sizeof(g_pending));
+            Serial.println(F("peers e pending azzerati"));
+            break;
+        }
+        case 'Y': {
+            g_bleScanEnabled = !g_bleScanEnabled;
+            Serial.printf("BLE central scan %s\n", g_bleScanEnabled ? "ON" : "OFF");
+            if (!g_bleScanEnabled) {
+                for (int i = 0; i < BLE_MAX_CENTRALS; i++) {
+                    if (g_bleCentrals[i].active) {
+                        if (g_bleCentrals[i].client) g_bleCentrals[i].client->disconnect();
+                        delete g_bleCentrals[i].client;
+                        memset(&g_bleCentrals[i], 0, sizeof(BleCentralLink));
+                    }
+                }
+            }
+            break;
+        }
+        case 'R': {
+            Serial.println(F("[RADIO] re-init"));
+            radio.standby();
+            delay(50);
+            radio.startReceive();
+            Serial.println(F("[RADIO] ok"));
+            break;
+        }
+        case 'p': {
+            int n = 0;
+            for (int i = 0; i < MAX_PEERS; i++) {
+                if (peers[i].state == PEER_NONE) continue;
+                Serial.printf("peer %08X [%s] via=%s x25519=%d\n",
+                              peers[i].peerID, peerStateName(peers[i].state),
+                              protoName(peers[i].lastSeenProto),
+                              peers[i].has_x25519_pk);
+                n++;
+            }
+            if (n == 0) Serial.println(F("nessun peer"));
+            break;
+        }
+        case 'P': {
+            Serial.printf("policy=%s wl=%u bl=%u\n",
+                          policyName(g_policy), g_whitelist_count, g_blocklist_count);
+            break;
+        }
+        case 'W': {
+            Serial.printf("LoRa:%d WiFi:%d BT:%d bleConn:%d centrals:%d/%d scan:%d\n",
+                          g_loraReady, g_wifiReady, g_btReady, g_bleCentralConnected,
+                          g_bleCentrals[0].active + g_bleCentrals[1].active,
+                          BLE_MAX_CENTRALS, g_bleScanEnabled);
+            Serial.printf("WiFi STA:%s AP:%s\n",
+                          WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString().c_str() : "no",
+                          (WiFi.getMode() & WIFI_MODE_AP) ? WiFi.softAPIP().toString().c_str() : "no");
+            break;
+        }
+        case 'i': {
+            Serial.printf("FEC=%u INT=%u foreign=%lu crc=%lu\n",
+                          DynamicFEC(interference_level), interference_level,
+                          (unsigned long)foreign_packets_count,
+                          (unsigned long)crc_error_count);
+            break;
+        }
+        case 'h': {
+            const char* m = "Hello world";
+            sendSecureOrPlain(MSG_CHAT, BROADCAST_ID, (const uint8_t*)m, strlen(m));
+            break;
+        }
+        case 'k': kyberEnsureKeypair(); Serial.println(F("[KYBER] PK ready")); break;
+        case 'x': x25519EnsureKeypair(); Serial.println(F("[X25519] PK ready")); break;
+        case '?': serialHelp(); break;
+        default:
+            Serial.printf("cmd '%c' sconosciuto. usa '?'\n", cmd);
+            break;
+    }
+}
+
 static void serialTick() {
     while (Serial.available()) {
-        int c = Serial.read();
-        switch (c) {
-            case 'h': {
-                const char* m = "Hello world";
-                sendSecureOrPlain(MSG_CHAT, BROADCAST_ID, (const uint8_t*)m, strlen(m));
-                break;
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (s_cmdLen > 0) {
+                s_cmdBuf[s_cmdLen] = 0;
+                serialProcessLine(s_cmdBuf);
+                s_cmdLen = 0;
             }
-            case 'k': kyberEnsureKeypair(); Serial.println("[KYBER] PK ready"); break;
-            case 'x': x25519EnsureKeypair(); Serial.println("[X25519] PK ready"); break;
-            case 'i':
-                Serial.printf("FEC=%u INT=%u foreign=%lu crc=%lu\n",
-                              DynamicFEC(interference_level), interference_level,
-                              (unsigned long)foreign_packets_count,
-                              (unsigned long)crc_error_count);
-                break;
-            case 'p':
-                for (int i = 0; i < MAX_PEERS; i++)
-                    if (peers[i].state != PEER_NONE)
-                        Serial.printf("peer %08X [%s] via=%s x25519=%d\n",
-                                      peers[i].peerID, peerStateName(peers[i].state),
-                                      protoName(peers[i].lastSeenProto),
-                                      peers[i].has_x25519_pk);
-                break;
-            case 'A': {
-                int idx = 0;
-                for (int i = 0; i < MAX_PEERS; i++)
-                    if (peers[i].state == PEER_PENDING_IN)
-                        Serial.printf("[%d] pending-in %08X\n", idx++, peers[i].peerID);
-                if (!idx) Serial.println("nessun pending");
-                break;
-            }
-            case 'a':
-                for (int i = 0; i < MAX_PEERS; i++)
-                    if (peers[i].state == PEER_PENDING_IN) { peerAcceptPending(peers[i].peerID); break; }
-                break;
-            case 'r':
-                for (int i = 0; i < MAX_PEERS; i++)
-                    if (peers[i].state == PEER_PENDING_IN) { peerRejectPending(peers[i].peerID); break; }
-                break;
-            case 'P':
-                Serial.printf("policy=%s wl=%u bl=%u\n",
-                              policyName(g_policy), g_whitelist_count, g_blocklist_count);
-                break;
-            case 'W':
-                Serial.printf("LoRa:%d WiFi:%d BT:%d bleConn:%d centrals:%d/%d\n",
-                              g_loraReady, g_wifiReady, g_btReady, g_bleCentralConnected,
-                              g_bleCentrals[0].active + g_bleCentrals[1].active, BLE_MAX_CENTRALS);
-                Serial.printf("WiFi STA:%s AP:%s\n",
-                              WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString().c_str() : "no",
-                              (WiFi.getMode() & WIFI_MODE_AP) ? WiFi.softAPIP().toString().c_str() : "no");
-                break;
+        } else if (s_cmdLen < sizeof(s_cmdBuf) - 1) {
+            s_cmdBuf[s_cmdLen++] = c;
         }
     }
 }
@@ -2361,11 +2622,66 @@ static void setupOLED() {
     oled.display();
 }
 
+// ============================================================================
+// 30. MAIN TASK (sostituisce loop() per avere 16 KB di stack)
+// ============================================================================
+static void mainTask(void*) {
+    for (;;) {
+        if (nowMs() - lastActivity > 10UL * 60UL * 1000UL) enterSleep();
+
+        // Processa pacchetti BLE ricevuti (dequeued dalle callback NimBLE)
+        GPacket bp;
+        while (xQueueReceive(bleRxQueue, &bp, 0) == pdTRUE) {
+            if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) == pdTRUE) {
+                handleReceivedPacketFromProto(bp, PROTO_BT);
+                xSemaphoreGiveRecursive(stateMutex);
+            }
+        }
+
+        if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) == pdTRUE) {
+            outgoingTick();
+            rxSlotsSweep();
+            peersSweep();
+            onionTrackerSweep();
+            heartbeatTick();
+            serialTick();
+            xSemaphoreGiveRecursive(stateMutex);
+        }
+        wifiDataTick();
+        // wifiStaTry();  // DISABILITATO: stack overflow
+
+        if (nowMs() < g_plaintextWarnUntil) updateUI("PLAINTEXT!", "msg in chiaro");
+        else {
+            int pend = 0;
+            for (int i = 0; i < MAX_PEERS; i++) if (peers[i].state == PEER_PENDING_IN) pend++;
+            char b[24];
+            if (pend) { snprintf(b, sizeof(b), "%d richieste", pend); updateUI("PENDING", b); }
+            else { snprintf(b, sizeof(b), "via %s", protoName(g_lastRxProto)); updateUI("READY", b); }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== Qorlyn ===");
     Serial.printf("GPacket=%u Peer=%u\n", (unsigned)sizeof(GPacket), (unsigned)sizeof(PeerSession));
+
+    // Distinzione cold boot vs warm reset via RTC magic
+    if (g_rtc_magic != RTC_MAGIC) {
+        Serial.println("[BOOT] cold boot: reset completo RTC");
+        memset(peers, 0, sizeof(peers));
+        g_sessionCounter = 0;
+        g_policy = POLICY_MANUAL;
+        g_blocklist_count = 0;
+        g_whitelist_count = 0;
+        g_kyber_ready = false;
+        g_x25519_ready = false;
+        g_rtc_magic = RTC_MAGIC;
+    } else {
+        Serial.println("[BOOT] warm reset: stato RTC preservato");
+    }
 
     myID = g_myID ? g_myID : generateDeviceID();
     g_myID = myID;
@@ -2373,9 +2689,7 @@ void setup() {
 
     stateMutex = xSemaphoreCreateRecursiveMutex();
     txQueue    = xQueueCreate(16, sizeof(TxRequest));
-
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) memset(peers, 0, sizeof(peers));
+    bleRxQueue = xQueueCreate(8, sizeof(GPacket));
 
     memset(g_pending, 0, sizeof(g_pending));
     memset(rxSlots, 0, sizeof(rxSlots));
@@ -2388,41 +2702,22 @@ void setup() {
     if (!setupRadio()) updateUI("ERROR", "radio fail");
 
     xTaskCreatePinnedToCore(radioTask, "radio", 8192, nullptr, 2, &radioTaskHandle, 1);
+    xTaskCreatePinnedToCore(mainTask, "main", 16384, nullptr, 2, nullptr, 1);
 
     if (!g_kyber_ready) kyberEnsureKeypair();
     x25519EnsureKeypair();
 
-    // WiFi setup in task (scan blocca)
-    xTaskCreatePinnedToCore(wifiSetupTask, "wifi", 8192, nullptr, 1, &wifiTaskHandle, 0);
-
+    wifiSetupSync();
     setupWeb();
     bleSetup();
 
     lastActivity = nowMs();
     updateUI("READY", policyName(g_policy));
+    Serial.println("[BOOT] pronto. digita '?' per i comandi");
 }
 
 void loop() {
-    if (nowMs() - lastActivity > 10UL * 60UL * 1000UL) enterSleep();
-
-    if (xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY) == pdTRUE) {
-        outgoingTick();
-        rxSlotsSweep();
-        peersSweep();
-        onionTrackerSweep();
-        heartbeatTick();
-        serialTick();
-        xSemaphoreGiveRecursive(stateMutex);
-    }
-    wifiDataTick();
-
-    if (nowMs() < g_plaintextWarnUntil) updateUI("PLAINTEXT!", "msg in chiaro");
-    else {
-        int pend = 0;
-        for (int i = 0; i < MAX_PEERS; i++) if (peers[i].state == PEER_PENDING_IN) pend++;
-        char b[24];
-        if (pend) { snprintf(b, sizeof(b), "%d richieste", pend); updateUI("PENDING", b); }
-        else { snprintf(b, sizeof(b), "via %s", protoName(g_lastRxProto)); updateUI("READY", b); }
-    }
-    delay(20);
+    // Tutto il lavoro gira su mainTask (stack 16 KB)
+    // loopTask di Arduino resta solo per compatibilita'
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
