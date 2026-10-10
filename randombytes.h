@@ -27,7 +27,6 @@
  *    @ Telegram: qorlyn.org/telegram
  *    @ GitHub:   qorlyn.org/github
  *    Donate:     qorlyn.org/donate
- NOTE: CODE NOT TESTED.
  * ==========================================================================*/
 
 #ifndef RANDOMBYTES_H
