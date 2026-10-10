@@ -1,11 +1,11 @@
 # <img src="assets/qorlyn-symbol.svg" width="32" alt="Qorlyn"> QORLYN
 
-### La rete che resta quando il resto smette.
+### The network that remains when the rest stops.
 
 **Quantum Onion Routing Lattice lYnx Network**
 
-Comunicazione mesh decentralizzata, post-quantistica, resistente alla censura.
-Nata sul campo. Per chi non ha alternative.
+Decentralized, post-quantum, censorship-resistant mesh communication.
+Born on the field. For those who have no alternatives.
 
 <br>
 
@@ -14,20 +14,20 @@ Nata sul campo. Per chi non ha alternative.
 [![Status](https://img.shields.io/badge/STATUS-ALPHA-E8A800?style=for-the-badge)](STATUS.md)
 [![Version](https://img.shields.io/badge/VERSION-0.1.0--alpha-0A0A0A?style=for-the-badge)](CHANGELOG.md)
 
-[![Platform](https://img.shields.io/badge/PLATFORM-ESP32--S3-2A7FA8?style=for-the-badge&logo=espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32-s3)
+[![Platform](https://img.shields.io/badge/PLATFORM-ESP32--S3-2A7FA8?style=for-the-badge&logo =espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32-s3)
 [![Radio](https://img.shields.io/badge/RADIO-LoRa%20868%20MHz-5C8B2F?style=for-the-badge)](https://qorlyn.org/docs/radio)
 [![PQC](https://img.shields.io/badge/PQC-KYBER--512-00B8D4?style=for-the-badge)](https://qorlyn.org/docs/crypto)
 [![Onion](https://img.shields.io/badge/ONION-X25519%20PER--HOP-0F3A52?style=for-the-badge)](https://qorlyn.org/docs/onion)
 
 [![Server](https://img.shields.io/badge/SERVER-ZERO-0A0A0A?style=for-the-badge)](https://qorlyn.org/manifesto)
-[![Non Profit](https://img.shields.io/badge/NON--PROFIT-100%25-5C8B2F?style=for-the-badge)](https://qorlyn.org/manifesto)
+[![Not [![Non-Profit](https://img.shields.io/badge/NON--PROFIT-100%25-5C8B2F?style=for-the-badge)](https://qorlyn.org/manifesto)
 [![Open Source](https://img.shields.io/badge/OPEN-SOURCE-00B8D4?style=for-the-badge)](https://github.com/qorlyn)
 [![PRs](https://img.shields.io/badge/PRs-WELCOME-00B8D4?style=for-the-badge)](CONTRIBUTING.md)
 [![Made in Italy](https://img.shields.io/badge/MADE%20IN-ITALY-0A0A0A?style=for-the-badge)](https://qorlyn.org)
 
 <br>
 
-[**Manifesto**](https://qorlyn.org/manifesto) · [**Cos'è**](#cosè-qorlyn) · [**Come funziona**](#come-funziona) · [**Dispositivi**](#dispositivi) · [**Download**](#download) · [**Contribuire**](CONTRIBUTING.md) · [**Contatti**](#contatti)
+[**Manifesto**](https://qorlyn.org/manifesto) · [**What is it?**](#what-is-qorlyn) · [**How ​​it works**](#how-it-works) · [**Devices**](#devices) · [**Download**](#download) · [**Contribute**](CONTRIBUTING.md) · [**Contact**](#contact)
 
 ---
 
@@ -35,222 +35,215 @@ Nata sul campo. Per chi non ha alternative.
 
 ---
 
-## Cos'è Qorlyn
+## What is Qorlyn?
 
-C'è un momento preciso in cui capisci che il mondo che ti avevano promesso non esiste.
+There is a precise moment when you realize that the world you were promised doesn't exist.
 
-Sei in una zona di guerra, o sotto un regime che ha appena spento internet, o in un campo profughi dopo un terremoto. Le torri cellulari sono cadute. La SIM non prende. Il satellite costa tremila euro e ti traccia.
+You are in a war zone, or under a regime that has just shut down the internet, or in a refugee camp after an earthquake. Cell towers have fallen. Your SIM has no signal. Satellite connections cost three thousand euros and track your location.
 
-Hai bisogno di mandare un messaggio. Poche parole. Un pezzo, una coordinata, un "sono vivo".
+You need to send a message. Just a few words. A snippet of info, a coordinate, an "I'm alive."
 
-Il tuo telefono è inutile. Le radio normali sono in chiaro, chiunque può ascoltare. Le app di messaggistica hanno bisogno di internet, e internet non c'è.
+Your phone is useless. Standard radio broadcasts are unencrypted; anyone can listen. Messaging apps require the internet, and the internet isn't available.
 
-**Qorlyn esiste per quel momento.**
+**Qorlyn exists for that moment.**
 
-Qorlyn è un protocollo di comunicazione **decentralizzato, anonimo, post-quantistico**. Funziona senza internet, senza SIM, senza server, senza permessi. Ogni dispositivo è un nodo. Ogni nodo è pari. La rete si forma dove serve, si scioglie quando non serve più.
+Qorlyn is a **decentralized, anonymous, post-quantum** communication protocol. It operates without the internet, SIM cards, servers, or permissions. Every device is a node. Every node is an equal peer. The network forms where it is needed and dissolves when no longer required.
 
-Non è un prodotto commerciale. È uno **standard aperto**, sotto licenza [AGPL-3.0](LICENSE). Il codice è pubblico. Chiunque può verificarlo, modificarlo, distribuirlo. Nessuno può chiuderlo, venderlo come proprietario, o metterci una backdoor.
+It is not a commercial product. It is an **open standard** licensed under [AGPL-3.0](LICENSE). The code is public. Anyone can verify, modify, or distribute it. No one can shut it down, sell it as proprietary software, or insert a backdoor.
 
-> **Qorlyn è la rete. Lynx è il dispositivo. Il protocollo è di tutti.**
-
----
-
-## Il problema
-
-Nel 2026, la censura è **antiquata**. Eppure esiste.
-
-Nel 2026, la sorveglianza di massa è **inutile**. Eppure esiste.
-
-Nel 2026, la dipendenza da infrastrutture centralizzate è **fragile**. Eppure esiste.
-
-**43 giornalisti** uccisi nel 2024, molti mentre cercavano di comunicare.
-**12 paesi** con blackout informativo attivo.
-**1.2 miliardi di persone** sotto sorveglianza di massa.
-
-**Qorlyn è la risposta tecnica a un problema umano.**
+> **Qorlyn is the network. Lynx is the device. The protocol belongs to everyone.**
 
 ---
 
-## Come funziona
+## The Problem
 
-### Crittografia post-quantistica
+In 2026, we are promised freedom, safety, and a future-ready existence.
+Yet censorship remains archaic; we are responding from the future—the very future we were promised.
 
-Kyber-512, lo standard NIST per resistere ai futuri computer quantistici. Ogni sessione ha chiavi effimere, distrutte dopo l'uso. Anche se qualcuno registra il traffico oggi, non potrà decifrarlo domani.
+**43 journalists** killed in 2024, many while attempting to communicate.
+**12 countries** with active information blackouts.
+**1.2 billion people** under mass surveillance.
+
+**Qorlyn is the technical answer to a human problem.**
+
+---
+
+## How It Works
+
+### Post-quantum cryptography
+
+Kyber-512, the NIST standard designed to withstand future quantum computers. Each session uses ephemeral keys that are destroyed after use. Even if someone records the traffic today, they will be unable to decrypt it tomorrow.
 
 ### Onion routing
 
-Ogni pacchetto attraversa tre nodi casuali prima di arrivare. Ogni hop conosce solo il precedente e il successivo. Nessun nodo vede insieme mittente e destinatario. Modello Tor, adattato alla radio.
+Each packet passes through three random nodes before reaching its destination. Each hop knows only the preceding and succeeding nodes. No single node sees both the sender and the recipient. Tor model, adapted for radio.
 
-### Trasporto LoRa
+### LoRa Transport
 
-Modulazione a spettro espanso, banda ISM libera (868 MHz in Europa). Fino a 12 km in campo aperto con 1.5W. Funziona sotto la soglia del rumore. Resistente al jamming per natura della modulazione.
+Spread-spectrum modulation, license-free ISM band (868 MHz in Europe). Up to 12 km range in open terrain with 1.5W. Operates below the noise floor. Jamming-resistant due to the nature of the modulation.
 
-[**Approfondisci l'architettura →**](https://qorlyn.org/docs/architecture)
-
----
-
-## Il wipe fisico
-
-<img src="assets/wipe-diagram.svg" alt="Wipe fisico: distruzione del chip in caso di sequestro" width="100%">
-
-Se ti prendono, se ti sequestrano il dispositivo, se provano a estrarre le chiavi con la forza — **tiri una corda**. Il chip si distrugge fisicamente. Non solo le chiavi. Il processore, la memoria, tutto. In meno di due secondi.
-
-Non c'è niente da recuperare, perché non c'è più niente.
-
-Gli HSM lo fanno sui server. I telefoni hanno il "cancella dati". Nessun dispositivo portatile commerciale ha una corda che rompe il silicio.
+[**Learn more about the architecture →**](https://qorlyn.org/docs/architecture)
 
 ---
 
-## Dispositivi
+## Physical wipe
 
-Quattro versioni, stesso protocollo. Un Vanilla e un BlackSil parlano la stessa lingua. Stessa cifratura. Stessa rete.
+<img src="assets/wipe-diagram.svg" alt="Physical wipe: chip destruction in the event of seizure" width="100%">
+
+If you get caught, if your device is seized, if they try to forcibly extract the keys from the silicon — **you pull a cord**. The chip is physically destroyed. Not just the keys. The processor, the memory, everything. In less than two seconds.
+
+There is nothing left to recover, because there is nothing left.
+
+HSMs do this on servers. Phones have a "wipe data" function. No commercial portable device has a cord that physically destroys the silicon.
+
+---
+
+## Devices
+
+Four versions, same protocol. A Vanilla and a BlackSil speak the same language. Same encryption. Same network.
 
 <table>
 <tr>
 <td align="center" width="25%">
 <img src="assets/device-vanilla.png" alt="Qorlyn Vanilla"><br>
 <b>Qorlyn Vanilla</b><br>
-<sub>Il punto d'ingresso</sub>
+<sub>The entry-level model</sub>
 </td>
 <td align="center" width="25%">
 <img src="assets/device-lynx.png" alt="Qorlyn Lynx"><br>
 <b>Qorlyn Lynx</b><br>
-<sub>Testato, più robusto</sub>
+<sub>Tested, more robust</sub>
 </td>
 <td align="center" width="25%">
 <img src="assets/device-blackout.png" alt="Qorlyn Lynx Blackout"><br>
 <b>Qorlyn Lynx Blackout</b><br>
-<sub>Per chi fa sul serio</sub>
+<sub>For serious users</sub>
 </td>
 <td align="center" width="25%">
 <img src="assets/device-blacksil.png" alt="Qorlyn BlackSil"><br>
 <b>Qorlyn BlackSil</b><br>
-<sub>Il flagship</sub>
+<sub>For those requiring absolute privacy</sub>
 </td>
 </tr>
 </table>
 
-**Qorlyn Vanilla** — Board Heltec V3.2, tastiera a membrana, case stampato in 3D. Fa tutto quello che serve per comunicare. Per civili, studenti, manifestanti.
+**Qorlyn Vanilla** — Heltec V3.2 board, membrane keypad, 3D-printed case. Does everything needed for communication. For civilians, students, and protesters.
 
-**Qorlyn Lynx** — PCB custom, batteria più grande, case IP54. Per attivisti, giornalisti freelance, escursionisti.
+**Qorlyn Lynx** — Custom PCB, larger battery, IP54-rated case. For activists, freelance journalists, and hikers.
 
-**Qorlyn Lynx Blackout** — GPS e microfono rimovibili fisicamente, doppia batteria, case IP67, wipe di emergenza. Per giornalisti a rischio, operatori in aree critiche.
+**Qorlyn Lynx Blackout** — Physically removable GPS and microphone, dual battery, IP67-rated case, emergency wipe function. For journalists at risk and personnel in critical areas.
 
-**Qorlyn BlackSil** — PUF, secure boot, sensori completi, pannello solare integrato, wipe fisico. Per reporter di guerra, ONG, sicurezza privata.
+**Qorlyn BlackSil** — PUF, secure boot, comprehensive sensors, integrated solar panel, physical wipe. For war reporters, NGOs, and private security.
 
-[**Specifiche complete →**](https://qorlyn.org/devices)
-
----
-
-## Cosa Qorlyn NON promette
-
-Preferiamo perdere un lettore che illudere chi si fida di noi.
-
-- **Non è un satellite.** Non manda video 4K. Non chiama dall'altra parte del mondo.
-- **La banda LoRa è stretta.** 20 kilobit al secondo. Testo, coordinate, SOS.
-- **L'anonimato assoluto non esiste.** Rendiamo il lavoro dell'attaccante difficile, non impossibile.
-- **L'onion routing nasconde il destinatario, non il mittente.** Il primo hop vede chi ha mandato il messaggio.
-- **Le frequenze dipendono dalle normative locali.** 868 MHz in Europa, 915 MHz negli USA.
-- **Qorlyn è uno strumento, non un miracolo.**
-
-La [threat model](https://qorlyn.org/threat-model) completa è pubblica. Leggila prima di usare Qorlyn in scenari critici.
+[**Full specifications →**](https://qorlyn.org/devices)
 
 ---
 
-## Download
+## What Qorlyn does NOT promise
+
+We would rather lose a reader than mislead those who trust us.
+
+- **It is not a satellite phone.** It does not transmit 4K video. It does not make calls to the other side of the world.
+- **LoRa bandwidth is narrow.** 20 kilobits per second. Text, coordinates, SOS, low-quality compressed audio.
+- **Absolute anonymity does not exist.** We make an attacker's job difficult, not impossible.
+- **Onion routing hides the recipient, not the sender.** The first hop sees who sent the message but does not know if they are the original sender.
+- **Frequencies depend on local regulations.** 868 MHz in Europe, 915 MHz in the USA.
+- **Qorlyn is a tool, not a miracle.**
+
+The complete [threat model](https://qorlyn.org/threat-model) is public. Read it before using Qorlyn in critical scenarios.
+
+---
+
+## Downloads
 
 ### Firmware
 
-| Canale | Versione | Link |
+| Channel | Version | Link |
 |---|---|---|
-| **Stabile** | v0.1.0-alpha | [Download](https://github.com/qorlyn/firmware/releases/latest) |
-| **Sviluppo** | main branch | [Clona il repo](https://github.com/qorlyn/firmware) |
-| **Archivio** | Tutte le release | [Releases](https://github.com/qorlyn/firmware/releases) |
+| **Stable** | v0.1.0-alpha | [Download](https://github.com/qorlyn/qorlyn-firmware/releases/latest) |
+| **Development** | main branch | [Clone the repo](https://github.com/qorlyn/qorlyn-firmware) |
+| **Archive** | All releases | [Releases](https://github.com/qorlyn/qorlyn-firmware/releases) |
 
-### Da cosa iniziare
+### Getting Started
 
-1. **Leggi la [guida all'installazione](https://qorlyn.org/docs/install)**
-2. **Controlla i [requisiti hardware](https://qorlyn.org/docs/hardware)**
-3. **Segui il [primo avvio](https://qorlyn.org/docs/first-boot)**
-4. **Unisciti al [Discord](https://qorlyn.org/discord)** per supporto
+1. **Read the [installation guide](https://qorlyn.org/docs/install)**
+2. **Check the [hardware requirements](https://qorlyn.org/docs/hardware)**
+3. **Follow the [first boot guide](https://qorlyn.org/docs/first-boot)**
+4. **Join the [Discord](https://qorlyn.org/discord)** for support
 
-### File del progetto
+### Project Files
 
-- [`CHANGELOG.md`](CHANGELOG.md) — Storia delle versioni
-- [`STATUS.md`](STATUS.md) — Stato attuale e bug noti
-- [`ROADMAP.md`](ROADMAP.md) — Cosa arriverà
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — Come contribuire
-- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Regole della community
+- [`CHANGELOG.md`](CHANGELOG.md) — Version history
+- [`STATUS.md`](STATUS.md) — Current status and known bugs
+- [`ROADMAP.md`](ROADMAP.md) — Upcoming features
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — How to contribute
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Community guidelines
 - [`LICENSE`](LICENSE) — AGPL-3.0
 
 ---
 
-## Stato attuale
+## Current Status
 
-**Versione:** v0.1.0-alpha
+**Version:** v0.1.0-alpha
 
-**Funziona, verificato su hardware:**
-- Handshake Kyber-512 via BLE
-- Scambio chiavi X25519
-- Chat cifrata end-to-end
-- Onion routing single-hop
-- Web UI completa
-- Gestione peer con policy, whitelist, blocklist
-- Persistenza RTC
+**Working / Verified on hardware:**
+- Kyber-512 handshake via BLE
+- X25519 key exchange
+- End-to-end encrypted chat
+- Single-hop onion routing
+- Full Web UI
+- Peer management with policies, whitelists, and blocklists
+- RTC persistence
 
-**Non funziona ancora:**
-- Onion multi-hop (serve un terzo board)
-- WiFi STA discovery (problema di stack)
-- Deep sleep (codice c'è, non testato)
-- Voce (Codec2, in sviluppo)
-- GPS, sensori (in sviluppo)
+**Not verified / Not yet working:**
+- Multi-hop onion routing
+- WiFi STA discovery (stack issue)
+- Deep sleep
+- Voice (Codec2, in development)
+- GPS, sensors (in development)
 
-**Arriverà:**
-- OTA firmware update
+**Coming soon:**
+- OTA firmware updates
 - PUF, secure boot
-- Produzione PCB
-- Certificazione CE/FCC
-- Primo lotto via Crowd Supply
+- PCB production
+- Hardware device certifications
+Full details in [`STATUS.md`](STATUS.md) and [`ROADMAP.md`](ROADMAP.md). ---
 
-Dettagli completi in [`STATUS.md`](STATUS.md) e [`ROADMAP.md`](ROADMAP.md).
+## Contributing
 
----
+Qorlyn is open source under the [AGPL-3.0](LICENSE) license. Anyone can contribute: bug fixes, hardware testing, documentation, translations, and security audits.
 
-## Contribuire
+**What we are looking for:**
+- Firmware bug fixes
+- Testing on real hardware (mandatory for every PR)
+- Translations (English, Spanish, Arabic, Farsi, Ukrainian, Russian)
+- Cryptographic code audits
 
-Qorlyn è open source sotto [AGPL-3.0](LICENSE). Chiunque può contribuire: bug fix, test su hardware, documentazione, traduzioni, audit di sicurezza.
+**What we are not looking for:**
+- Complete rewrites without prior discussion
+- Untested or misunderstood AI code (we accept AI-generated code, but not code that hasn't been reviewed, understood, and debugged)
+- Backdoors, telemetry, or tracking
 
-**Cosa cerchiamo:**
-- Bug fix nel firmware
-- Test su hardware reale (obbligatorio per ogni PR)
-- Traduzioni (inglese, spagnolo, arabo, farsi, ucraino, russo)
-- Audit del codice crittografico
-
-**Cosa non cerchiamo:**
-- Riscritture complete senza discussione
-- Codice AI non testato e non compreso
-- Backdoor, telemetria, tracking
-
-Linee guida complete in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Full guidelines in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
-## Domande frequenti
+## FAQ
 
-**Serve internet?** No. Mai.
-**Serve una SIM?** No. Mai.
-**Serve un server?** No. Non esiste un server Qorlyn.
-**È legale?** Sì, nella maggior parte dei paesi. Verifica le leggi locali.
-**Posso essere tracciato?** Il contenuto è cifrato. I metadati sono parzialmente nascosti dall'onion routing.
-**Quanto arriva lontano?** 10-15 km per hop in campo aperto. 1-3 km in città.
-**Posso parlare?** Non ancora. Voce in sviluppo (Codec2).
-**Chi c'è dietro?** Un piccolo team. Il progetto è progettato per essere forkabile e mantenuto dalla community.
+**Is an internet connection required?** No. Never.
+**Is a SIM card required?** No. Never.
+**Is a server required?** No. There is no Qorlyn server.
+**Is it legal?** Yes, in most countries.
 
-[**Altre domande →**](https://qorlyn.org/faq)
+Check local laws.
+**Can I be tracked?** Content is encrypted. Metadata is partially hidden via onion routing.
+**What is the range?** 10–15 km per hop in open terrain; 1–3 km in urban areas.
+**Can I use voice?** Not yet. Voice functionality is under development.
+**Who is behind it?** An independent developer. The project is designed to be forkable and community-maintained. [**More questions →**](https://qorlyn.org/faq)
 
 ---
 
-## Contatti
+## Contacts
 
 [![Website](https://img.shields.io/badge/Website-qorlyn.org-00B8D4?style=flat-square)](https://qorlyn.org)
 [![Email](https://img.shields.io/badge/Email-qorlyn@qorlyn.org-5C8B2F?style=flat-square)](mailto:qorlyn@qorlyn.org)
@@ -259,14 +252,14 @@ Linee guida complete in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 [![GitHub](https://img.shields.io/badge/GitHub-github.com%2Fqorlyn-0A0A0A?style=flat-square)](https://github.com/qorlyn)
 [![Forum](https://img.shields.io/badge/Forum-forum.qorlyn.org-5C8B2F?style=flat-square)](https://forum.qorlyn.org)
 
-**Canali dedicati**
-- **Sicurezza:** [security@qorlyn.org](mailto:security@qorlyn.org) — [policy completa](https://qorlyn.org/security)
-- **Condotta:** [conduct@qorlyn.org](mailto:conduct@qorlyn.org) — [code of conduct](CODE_OF_CONDUCT.md)
-- **Stampa:** [press@qorlyn.org](mailto:press@qorlyn.org)
+**Dedicated channels**
+- **Security:** [security@qorlyn.org](mailto:security@qorlyn.org) — [full policy](https://qorlyn.org/security)
+- **Conduct:** [conduct@qorlyn.org](mailto:conduct@qorlyn.org) — [code of conduct](CODE_OF_CONDUCT.md)
+- **Press:** [press@qorlyn.org](mailto:press@qorlyn.org)
 
-**Sostieni il progetto**
-- [Donazioni](https://qorlyn.org/donate)
-- [Sponsor](https://github.com/sponsors/qorlyn)
+**Support the project**
+- [Donations](https://qorlyn.org/donate)
+- [Sponsors](https://github.com/sponsors/qorlyn)
 
 ---
 
@@ -276,7 +269,7 @@ Linee guida complete in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 **QORLYN**
 
-*La rete che resta quando il resto smette.*
+*The network that remains when the rest stops.*
 
 <sub>AGPL-3.0-or-later · Non-profit · Open source · Made in Italy</sub>
 
