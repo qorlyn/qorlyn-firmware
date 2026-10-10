@@ -1,4 +1,4 @@
-# <img src="assets/qorlyn-symbol.svg" width="32" alt="Qorlyn"> QORLYN
+# <img src="assets/logo-qorlyn.png" width="32" alt="Qorlyn"> QORLYN
 
 ### The network that remains when the rest stops.
 
