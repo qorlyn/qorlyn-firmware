@@ -16,9 +16,6 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  *
  * ----------------------------------------------------------------------------
- * ML-KEM (Kyber-512) + AES-256-GCM + Onion routing (X25519 effimero per-hop)
- * + Multi-protocol transport (LoRa / WiFi STA+AP / BLE peripheral+central)
- * ----------------------------------------------------------------------------
  * Connect with us:
  *   🌐 Website:  https://qorlyn.org
  *   📧 Email:    qorlyn@qorlyn.org
