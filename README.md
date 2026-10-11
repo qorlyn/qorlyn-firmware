@@ -12,13 +12,13 @@ Born on the field. For those who have no alternatives.
 [![Status](https://img.shields.io/badge/STATUS-ALPHA-E8A800?style=for-the-badge)](STATUS.md)
 [![Version](https://img.shields.io/badge/VERSION-0.1.0--alpha-0A0A0A?style=for-the-badge)](CHANGELOG.md)
 
-[![Platform](https://img.shields.io/badge/PLATFORM-ESP32--S3-2A7FA8?style=for-the-badge&logo =espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32-s3)
+[![Platform](https://img.shields.io/badge/PLATFORM-ESP32--S3-2A7FA8?style=for-the-badge&logo=espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32-s3)
 [![Radio](https://img.shields.io/badge/RADIO-LoRa%20868%20MHz-5C8B2F?style=for-the-badge)](https://qorlyn.org/docs/radio)
 [![PQC](https://img.shields.io/badge/PQC-KYBER--512-00B8D4?style=for-the-badge)](https://qorlyn.org/docs/crypto)
 [![Onion](https://img.shields.io/badge/ONION-X25519%20PER--HOP-0F3A52?style=for-the-badge)](https://qorlyn.org/docs/onion)
 
 [![Server](https://img.shields.io/badge/SERVER-ZERO-0A0A0A?style=for-the-badge)](https://qorlyn.org/manifesto)
-[![Not [![Non-Profit](https://img.shields.io/badge/NON--PROFIT-100%25-5C8B2F?style=for-the-badge)](https://qorlyn.org/manifesto)
+[![Non-Profit](https://img.shields.io/badge/NON--PROFIT-100%25-5C8B2F?style=for-the-badge)](https://qorlyn.org/manifesto)
 [![Open Source](https://img.shields.io/badge/OPEN-SOURCE-00B8D4?style=for-the-badge)](https://github.com/qorlyn)
 [![PRs](https://img.shields.io/badge/PRs-WELCOME-00B8D4?style=for-the-badge)](CONTRIBUTING.md)
 [![Made in Italy](https://img.shields.io/badge/MADE%20IN-ITALY-0A0A0A?style=for-the-badge)](https://qorlyn.org)
