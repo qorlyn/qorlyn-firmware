@@ -1,3 +1,32 @@
+/* ============================================================================
+ * Qorlyn Firmware - https://github.com/qorlyn/qorlyn-firmware
+ *
+ * Copyright (C) 2026 Emanuele Ferraro (github.com/emanueleferraro)
+ * Copyright (C) 2026 Qorlyn (github.com/qorlyn)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * ----------------------------------------------------------------------------
+ * Connect with us:
+ *   🌐 Website:  https://qorlyn.org
+ *   📧 Email:    qorlyn@qorlyn.org
+ *   💬 Forum:    https://forum.qorlyn.org
+ *    @ Discord:  qorlyn.org/discord
+ *    @ Telegram: qorlyn.org/telegram
+ *    @ GitHub:   qorlyn.org/github
+ *    Donate:     qorlyn.org/donate
+ * ==========================================================================*/
 #ifndef PQC_KYBER_H
 #define PQC_KYBER_H
 
